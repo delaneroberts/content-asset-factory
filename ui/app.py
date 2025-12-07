@@ -13,73 +13,80 @@ from caf_app.image_gen import ImageProvider
 
 st.set_page_config(
     page_title="Content Asset Factory",
-    page_icon="📣",
+    page_icon="🎨",
     layout="wide",
 )
 
 
-# ---------- Global Styles (simple CSS) ----------
+# ---------- Global Styles ----------
 
 st.markdown(
     """
     <style>
-    /* Overall page tweaks */
-    .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 3rem;
-        max-width: 1200px;
+    /* App background gradient */
+    .stApp {
+        background: radial-gradient(circle at top left, #4f46e5 0, #2563eb 30%, #06b6d4 60%, #22c55e 100%);
     }
 
-    /* Top banner */
+    /* Main content container */
+    .block-container {
+        max-width: 1180px;
+        padding-top: 1.8rem;
+        padding-bottom: 3rem;
+    }
+
+    /* Hero banner at top */
     .caf-hero-banner {
-        background: linear-gradient(90deg, #111827, #1f2937, #4b5563);
-        border-radius: 18px;
+        background: linear-gradient(90deg, rgba(15,23,42,0.95), #1d4ed8, #0ea5e9);
+        border-radius: 24px;
         padding: 18px 22px;
-        margin-bottom: 18px;
+        margin-bottom: 20px;
         color: white;
         display: flex;
         align-items: center;
-        gap: 14px;
+        gap: 16px;
     }
     .caf-hero-icon {
-        font-size: 1.9rem;
+        font-size: 2.2rem;
     }
     .caf-hero-title {
-        font-size: 1.4rem;
-        font-weight: 600;
+        font-size: 1.5rem;
+        font-weight: 650;
         margin: 0;
     }
     .caf-hero-subtitle {
-        font-size: 0.9rem;
+        font-size: 0.95rem;
         margin: 2px 0 0 0;
-        opacity: 0.85;
+        opacity: 0.9;
     }
 
-    /* Card styling */
+    /* Generic card styling */
     .caf-card {
         background-color: #ffffff;
-        border-radius: 14px;
-        padding: 18px 18px 14px 18px;
-        border: 1px solid #e5e7eb;
-        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.03);
+        border-radius: 20px;
+        padding: 18px 20px 16px 20px;
+        border: 1px solid rgba(148,163,184,0.35);
+        box-shadow: 0 10px 25px rgba(15,23,42,0.16);
+        backdrop-filter: blur(6px);
+        -webkit-backdrop-filter: blur(6px);
         margin-bottom: 14px;
     }
 
-    /* Section headers */
+    /* Section titles inside cards */
     .caf-section-title {
         font-size: 1.05rem;
         font-weight: 600;
         margin-bottom: 0.4rem;
     }
 
-    /* Small tag/pill */
+    /* Small pill labels */
     .caf-pill {
         display: inline-flex;
         align-items: center;
         gap: 6px;
-        padding: 2px 9px;
+        padding: 2px 10px;
         border-radius: 999px;
-        font-size: 0.75rem;
+        font-size: 0.78rem;
         border: 1px solid #e5e7eb;
         background: #f9fafb;
         color: #4b5563;
@@ -87,7 +94,37 @@ st.markdown(
         margin-bottom: 4px;
     }
 
-    /* Tabs: slightly tighter */
+    /* Success badge */
+    .caf-success-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 0.8rem;
+        background: #ecfdf5;
+        color: #15803d;
+        border: 1px solid #bbf7d0;
+        margin-bottom: 10px;
+    }
+
+    /* Streamlit button tweak */
+    .stButton > button {
+        width: 100%;
+        border-radius: 999px;
+        height: 42px;
+        border: none;
+        font-weight: 600;
+        background: linear-gradient(90deg, #2563eb, #4f46e5);
+        color: white;
+        box-shadow: 0 8px 18px rgba(37,99,235,0.45);
+    }
+    .stButton > button:hover {
+        background: linear-gradient(90deg, #1d4ed8, #4338ca);
+        box-shadow: 0 10px 24px rgba(30,64,175,0.55);
+    }
+
+    /* Tabs tighter spacing */
     .stTabs [data-baseweb="tab-list"] {
         gap: 4px;
     }
@@ -96,6 +133,7 @@ st.markdown(
         padding-bottom: 6px;
         padding-left: 10px;
         padding-right: 10px;
+        font-size: 0.85rem;
     }
     </style>
     """,
@@ -103,46 +141,16 @@ st.markdown(
 )
 
 
-# ---------- Sidebar: settings ----------
-
-st.sidebar.title("⚙️ Settings")
-
-provider_label = st.sidebar.selectbox(
-    "Image provider",
-    [
-        "Placeholder only",
-        "OpenAI (gpt-image-1)",
-        "Gemini (image-1)",
-    ],
-    index=0,
-    help=(
-        "For this demo, all providers currently use placeholder images, "
-        "but the selected provider is recorded in campaign metadata."
-    ),
-)
-
-provider_map: Dict[str, ImageProvider] = {
-    "OpenAI (gpt-image-1)": ImageProvider.OPENAI,
-    "Gemini (image-1)": ImageProvider.GEMINI,
-    "Placeholder only": ImageProvider.PLACEHOLDER,
-}
-
-st.sidebar.markdown("---")
-st.sidebar.caption(
-    "Generated assets are saved under the `campaigns/` folder in your project."
-)
-
-
-# ---------- Top banner ----------
+# ---------- Hero banner ----------
 
 st.markdown(
     """
     <div class="caf-hero-banner">
-      <div class="caf-hero-icon">📣</div>
+      <div class="caf-hero-icon">🎨</div>
       <div>
         <p class="caf-hero-title">Content Asset Factory</p>
         <p class="caf-hero-subtitle">
-          Generate a ready-to-hand-off campaign package: hero & supporting images,
+          Generate a ready-to-hand-off campaign package – hero & supporting images,
           copy, and a downloadable ZIP for designers or clients.
         </p>
       </div>
@@ -152,52 +160,88 @@ st.markdown(
 )
 
 
-# ---------- Main form ----------
+# ---------- Main layout: three columns (inputs | generated | right rail) ----------
 
-with st.container():
+col_inputs, col_generated, col_right = st.columns([1.1, 1.35, 1.0])
+
+# ---------- Left: Campaign inputs (inside a form) ----------
+
+with col_inputs:
     with st.form("campaign_form"):
-        st.markdown("#### Campaign inputs")
+        st.markdown('<div class="caf-card">', unsafe_allow_html=True)
+        st.markdown('<div class="caf-section-title">Campaign inputs</div>', unsafe_allow_html=True)
 
-        col_name, col_brief = st.columns([1, 2])
+        campaign_name = st.text_input(
+            "Campaign name",
+            value="Evo Soda Launch",
+            placeholder="e.g., Evo Soda Summer Launch",
+        )
 
-        with col_name:
-            campaign_name = st.text_input(
-                "Campaign name",
-                value="Evo Soda Launch",
-                placeholder="e.g., Evo Soda Summer Launch",
-            )
+        campaign_brief = st.text_area(
+            "Campaign brief",
+            height=190,
+            placeholder=(
+                "Describe the product, audience, tone, and goals.\n\n"
+                "Example: A new zero-sugar sparkling water aimed at busy "
+                "professionals who want something refreshing but healthy..."
+            ),
+        )
 
-        with col_brief:
-            campaign_brief = st.text_area(
-                "Campaign brief",
-                height=180,
-                placeholder=(
-                    "Describe the product, audience, tone, and goals.\n\n"
-                    "Example: A new zero-sugar sparkling water aimed at busy "
-                    "professionals who want something refreshing but healthy..."
-                ),
-            )
+        st.markdown("")  # spacing
+        submitted = st.form_submit_button("Generate campaign 🚀🎨")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        submitted = st.form_submit_button("Generate campaign 🚀")
+# ---------- Right rail: Settings card (always visible) ----------
+
+with col_right:
+    st.markdown('<div class="caf-card">', unsafe_allow_html=True)
+    st.markdown('<div class="caf-section-title">Settings</div>', unsafe_allow_html=True)
+
+    provider_label = st.selectbox(
+        "Image provider",
+        [
+            "Placeholder only",
+            "OpenAI (gpt-image-1)",
+            "Gemini (image-1)",
+        ],
+        index=0,
+        help=(
+            "For this demo, all providers currently use placeholder images, "
+            "but the selected value is stored in campaign metadata."
+        ),
+    )
+
+    provider_map: Dict[str, ImageProvider] = {
+        "OpenAI (gpt-image-1)": ImageProvider.OPENAI,
+        "Gemini (image-1)": ImageProvider.GEMINI,
+        "Placeholder only": ImageProvider.PLACEHOLDER,
+    }
+
+    st.caption(
+        "Generated assets are saved under the `campaigns/<slug>/` folder "
+        "in your project."
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
-# ---------- Handle submission ----------
+# ---------- Handle submission & show results ----------
 
 if submitted:
     if not campaign_name.strip() or not campaign_brief.strip():
-        st.error("Please provide both a **campaign name** and a **brief**.")
+        with col_generated:
+            st.error("Please provide both a **campaign name** and a **brief**.")
     else:
         image_provider: ImageProvider = provider_map[provider_label]
 
-        with st.spinner(f"Generating campaign using {provider_label}..."):
-            result: Dict[str, Any] = generate_campaign(
-                campaign_name=campaign_name,
-                campaign_brief=campaign_brief,
-                image_provider=image_provider,
-            )
+        with col_generated:
+            with st.spinner(f"Generating campaign using {provider_label}..."):
+                result: Dict[str, Any] = generate_campaign(
+                    campaign_name=campaign_name,
+                    campaign_brief=campaign_brief,
+                    image_provider=image_provider,
+                )
 
-        st.success("Campaign generated successfully ✅")
-
+        # Unpack result
         slug = result["slug"]
         campaign_dir: Path = result["campaign_dir"]
         text_assets = result["text_assets"]
@@ -205,115 +249,105 @@ if submitted:
         supporting_paths = result["supporting_paths"]
         zip_path: Path = result["zip_path"]
 
-        # ---------- Summary / metadata card ----------
+        # ----- Center column: Generated campaign card -----
 
-        with st.container():
+        with col_generated:
+            st.markdown('<div class="caf-card">', unsafe_allow_html=True)
+            st.markdown('<div class="caf-section-title">Generated campaign</div>', unsafe_allow_html=True)
+
+            st.markdown(
+                '<div class="caf-success-pill">✅ Campaign generated successfully</div>',
+                unsafe_allow_html=True,
+            )
+
             st.markdown(
                 f"""
-                <div class="caf-card">
-                  <div class="caf-section-title">Campaign overview</div>
-                  <div style="margin-bottom: 4px;">
-                    <span class="caf-pill">Slug: <code>{slug}</code></span>
-                    <span class="caf-pill">Provider: <code>{image_provider.value}</code></span>
-                  </div>
-                  <div style="font-size:0.85rem; color:#4b5563; margin-top:4px;">
-                    Folder: <code>campaigns/{slug}</code><br/>
-                    ZIP: <code>{zip_path.name}</code>
-                  </div>
+                <div style="margin-bottom: 6px;">
+                  <span class="caf-pill">Slug: <code>{slug}</code></span>
+                  <span class="caf-pill">Provider: <code>{image_provider.value}</code></span>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-        # ---------- Layout: images + key copy ----------
+            # Images + key text in a sub layout
+            img_col, text_col = st.columns([1.05, 1.0])
 
-        col_left, col_right = st.columns([1.4, 1])
+            with img_col:
+                st.image(str(hero_path), caption="Hero image", width="stretch")
 
-        # Left: images
-        with col_left:
-            st.markdown('<div class="caf-card">', unsafe_allow_html=True)
-            st.markdown('<div class="caf-section-title">Hero image</div>', unsafe_allow_html=True)
+                st.markdown('<div class="caf-section-title" style="margin-top:0.6rem;">Supporting images</div>', unsafe_allow_html=True)
+                support_cols = st.columns(3)
+                for i, (p, c) in enumerate(zip(supporting_paths, support_cols), start=1):
+                    with c:
+                        st.image(str(p), caption=f"{i}", width="stretch")
 
-            st.image(str(hero_path), caption="Hero", width="stretch")
+            with text_col:
+                st.markdown('<div class="caf-section-title">Tagline</div>', unsafe_allow_html=True)
+                st.write(text_assets["tagline"])
 
-            st.markdown('<div class="caf-section-title" style="margin-top:0.6rem;">Supporting images</div>', unsafe_allow_html=True)
+                st.markdown('<div class="caf-section-title" style="margin-top:0.7rem;">Value proposition</div>', unsafe_allow_html=True)
+                st.write(text_assets["value_prop"])
 
-            cols_support = st.columns(3)
-            for i, (p, c) in enumerate(zip(supporting_paths, cols_support), start=1):
-                with c:
-                    st.image(str(p), caption=f"Support {i}", width="stretch")
+                st.markdown('<div class="caf-section-title" style="margin-top:0.7rem;">Call-to-actions</div>', unsafe_allow_html=True)
+                for line in text_assets["ctas"].splitlines():
+                    line = line.strip()
+                    if line:
+                        st.markdown(f"- **{line}**")
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # Right: core copy
+        # ----- Right rail: Key copy card -----
+
         with col_right:
             st.markdown('<div class="caf-card">', unsafe_allow_html=True)
+            st.markdown('<div class="caf-section-title">Key copy</div>', unsafe_allow_html=True)
 
-            st.markdown('<div class="caf-section-title">Tagline</div>', unsafe_allow_html=True)
+            st.markdown("**Tagline**")
             st.write(text_assets["tagline"])
 
-            st.markdown('<div class="caf-section-title" style="margin-top:0.8rem;">Slogans</div>', unsafe_allow_html=True)
+            st.markdown("**Slogans**")
             for line in text_assets["slogans"].splitlines():
                 line = line.strip()
                 if line:
                     st.markdown(f"- {line}")
 
-            st.markdown('<div class="caf-section-title" style="margin-top:0.8rem;">Value proposition</div>', unsafe_allow_html=True)
-            st.write(text_assets["value_prop"])
-
-            st.markdown('<div class="caf-section-title" style="margin-top:0.8rem;">Call-to-actions</div>', unsafe_allow_html=True)
+            st.markdown("**Call-to-actions**")
             for line in text_assets["ctas"].splitlines():
                 line = line.strip()
                 if line:
-                    st.markdown(f"- **{line}**")
+                    st.markdown(f"- {line}")
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # ---------- Tabs for details ----------
-
-        st.markdown("")  # small spacing
-        with st.container():
+            # Files card
             st.markdown('<div class="caf-card">', unsafe_allow_html=True)
+            st.markdown('<div class="caf-section-title">Files & ZIP</div>', unsafe_allow_html=True)
+            st.markdown(f"- Folder: `{campaign_dir}`")
+            st.markdown(f"- ZIP: `{zip_path.name}`")
 
-            tab_social, tab_summary, tab_prompts, tab_files = st.tabs(
-                ["📱 Social posts", "📝 Summary", "🧠 Prompts used", "📂 Files & ZIP"]
-            )
+            if zip_path.exists():
+                with zip_path.open("rb") as f:
+                    zip_bytes = f.read()
 
-            with tab_social:
-                st.subheader("Social posts")
-                st.code(text_assets["social_posts"], language="markdown")
-
-            with tab_summary:
-                st.subheader("Campaign summary")
-                st.write(text_assets["summary"])
-
-            with tab_prompts:
-                st.subheader("LLM prompts used")
-                st.caption(
-                    "These are the exact prompts used to generate the copy, "
-                    "saved as `generation_prompts.txt` inside the campaign folder."
+                st.download_button(
+                    label="⬇️ Download campaign ZIP",
+                    data=zip_bytes,
+                    file_name=zip_path.name,
+                    mime="application/zip",
                 )
-                st.code(text_assets["_prompts"], language="markdown")
-
-            with tab_files:
-                st.subheader("Files")
-                st.markdown(f"- Folder: `{campaign_dir}`")
-                st.markdown(f"- ZIP: `{zip_path.name}`")
-
-                if zip_path.exists():
-                    with zip_path.open("rb") as f:
-                        zip_bytes = f.read()
-
-                    st.download_button(
-                        label="⬇️ Download campaign ZIP",
-                        data=zip_bytes,
-                        file_name=zip_path.name,
-                        mime="application/zip",
-                    )
-                else:
-                    st.warning("ZIP file not found. Please check the backend.")
+            else:
+                st.warning("ZIP file not found. Please check the backend.")
 
             st.markdown("</div>", unsafe_allow_html=True)
 
 else:
-    st.info("Fill in the campaign name and brief, then click **Generate campaign 🚀**.")
+    # Nothing submitted yet – show a subtle hint in center column
+    with col_generated:
+        st.markdown('<div class="caf-card">', unsafe_allow_html=True)
+        st.markdown('<div class="caf-section-title">Generated campaign</div>', unsafe_allow_html=True)
+        st.info(
+            "When you generate a campaign, the hero image, supporting images, and key copy "
+            "will appear here."
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
