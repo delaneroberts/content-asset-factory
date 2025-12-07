@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "content-asset-factory"
+version = "0.1.0"
+description = "Campaign content generator demo (images + copy + ZIP export)"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+packages = [{ include = "caf_app" }, { include = "ui" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+streamlit = "^1.40.0"
+pillow = "^10.4.0"
+openai = "^1.50.0"
+python-dotenv = "^1.0.1"
+
+[tool.poetry.group.dev.dependencies]
+black = "^24.8.0"
+ruff = "^0.6.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

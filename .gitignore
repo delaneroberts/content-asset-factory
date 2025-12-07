@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+*.log
+
+# Virtual envs
+.venv/
+venv/
+
+# Poetry
+poetry.lock
+
+# VS Code
+.vscode/
+
+# Streamlit
+.streamlit/
+
+# OS crap
+.DS_Store
+
+# Generated artifacts
+campaigns/
+*.zip
+.env
+.env
+.env
