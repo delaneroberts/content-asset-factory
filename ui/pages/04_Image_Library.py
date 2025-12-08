@@ -61,7 +61,6 @@ def _default_image_prompt(campaign: Campaign) -> str:
         "clean background, no text or logos."
     )
 
-
 # ---- Engine-specific generators -------------------------------------------
 
 
@@ -80,10 +79,6 @@ def _generate_with_openai(
     """
     images_dir = _campaign_images_dir(campaign.slug)
 
-    # Optionally keep the old DALL·E 3 guard, but it's not strictly needed:
-    if engine == "dall-e-3" and n_images > 1:
-        n_images = 1
-
     try:
         # This matches your working testme.py call
         response = client.images.generate(
@@ -95,6 +90,7 @@ def _generate_with_openai(
         )
     except OpenAIError as e:
         raise RuntimeError(f"OpenAI image generation failed: {e}") from e
+
 
     # Decode the images and write them into the campaign's images dir
     assets: List[ImageAsset] = []
@@ -173,7 +169,6 @@ def _generate_image_files(
 
 # ---- Main UI ---------------------------------------------------------------
 
-
 def main() -> None:
     st.title("Image Library")
 
@@ -193,6 +188,20 @@ def main() -> None:
         return
 
     st.caption(f"Campaign: **{campaign.name}** (`{campaign.slug}`)")
+
+    # --- Pinned image (sidebar) ---------------------------------------------
+    pinned_path = st.session_state.get("pinned_image")
+    if pinned_path:
+        pinned_file = Path(pinned_path)
+        if pinned_file.exists():
+            st.sidebar.subheader("Pinned image")
+            st.sidebar.image(str(pinned_file), use_container_width=True)
+            if st.sidebar.button("Unpin image"):
+                del st.session_state["pinned_image"]
+                st.rerun()
+        else:
+            # Clear stale pinned path
+            st.session_state.pop("pinned_image", None)
 
     # --- Generation controls -------------------------------------------------
     st.markdown("### Generate new images")
@@ -222,7 +231,7 @@ def main() -> None:
 
         # Per-engine limits
         if engine == "dall-e-3":
-            max_images = 1
+            max_images = 4
         elif engine == "dall-e-2":
             max_images = 8
         else:  # nanobanana-hf
@@ -232,7 +241,7 @@ def main() -> None:
             "Count",
             min_value=1,
             max_value=max_images,
-            value=min(3, max_images),
+            value=min(4, max_images),
             step=1,
         )
 
@@ -308,11 +317,53 @@ def main() -> None:
                 with st.expander("Prompt"):
                     st.write(asset.prompt)
 
-            fav_label = "★ Unfavorite" if asset.is_favorite else "☆ Favorite"
-            if st.button(fav_label, key=f"fav_img_{asset.id}"):
-                asset.is_favorite = not asset.is_favorite
-                save_campaign(campaign)
-                st.rerun()
+            # --- Favorite + Pin + Delete controls ---
+            col_fav, col_pin, col_del = st.columns([3, 2, 1])
+
+            # Favorite / unfavorite
+            with col_fav:
+                fav_label = "★ Unfavorite" if asset.is_favorite else "☆ Favorite"
+                if st.button(fav_label, key=f"fav_img_{asset.id}"):
+                    asset.is_favorite = not asset.is_favorite
+                    save_campaign(campaign)
+                    st.rerun()
+
+            # 📌 Pin image
+            with col_pin:
+                if st.button("📌 Pin", key=f"pin_img_{asset.id}"):
+                    st.session_state["pinned_image"] = str(image_path)
+                    st.success("Pinned this image for reuse.")
+                    st.rerun()
+
+            # Delete image
+            with col_del:
+                if st.button("🗑", key=f"del_img_{asset.id}", help="Delete this image"):
+                    # Resolve the image file path on disk
+                    img_path = Path(asset.path)
+                    if not img_path.is_absolute():
+                        # If you have a _project_root() helper earlier in this file, use it:
+                        try:
+                            img_path = _project_root() / img_path  # type: ignore[name-defined]
+                        except NameError:
+                            # Fallback: assume asset.path is relative to current working dir
+                            img_path = Path.cwd() / img_path
+
+                    # 1) Delete the image file
+                    try:
+                        img_path.unlink(missing_ok=True)
+                    except Exception as e:
+                        st.error(f"Failed to delete file: {e}")
+                    else:
+                        # 2) Remove from the campaign's image_assets list
+                        campaign.image_assets = [
+                            a for a in campaign.image_assets
+                            if a.id != asset.id
+                        ]
+                        # 3) Persist the change
+                        save_campaign(campaign)
+                        # 4) Refresh the page so the image disappears
+                        st.rerun()
+
 
 
 if __name__ == "__main__":
