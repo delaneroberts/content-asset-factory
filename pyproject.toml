@@ -4,14 +4,21 @@ version = "0.1.0"
 description = "Campaign content generator demo (images + copy + ZIP export)"
 authors = ["Your Name <you@example.com>"]
 readme = "README.md"
-packages = [{ include = "caf_app" }, { include = "ui" }]
+packages = [
+  { include = "caf_app" }
+]
 
 [tool.poetry.dependencies]
 python = "^3.11"
+
+# Core app/runtime deps
 streamlit = "^1.40.0"
 pillow = "^10.4.0"
 openai = "^1.50.0"
 python-dotenv = "^1.0.1"
+requests = "^2.32.0"
+pydantic = "^2.9.0"
+python-slugify = "^8.0.4"
 
 [tool.poetry.group.dev.dependencies]
 black = "^24.8.0"
