@@ -1,4 +1,4 @@
-# ui/app.py
+# ui/home.py
 from dotenv import load_dotenv
 load_dotenv()
 

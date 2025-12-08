@@ -1,6 +1,6 @@
 # caf_app/storage.py
 from __future__ import annotations
-
+import shutil
 import json
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +46,15 @@ def _campaign_path(slug: str) -> Path:
 # Core campaign storage helpers
 # ---------------------------------------------------------------------------
 
+def delete_campaign(slug: str) -> None:
+    root = _project_root()
+    json_path = root / "campaigns" / f"{slug}.json"
+    if json_path.exists():
+        json_path.unlink()
+
+    images_path = root / "generated_images" / slug
+    if images_path.exists():
+        shutil.rmtree(images_path)
 
 def save_campaign(campaign: Campaign) -> None:
     """

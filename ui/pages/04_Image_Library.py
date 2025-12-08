@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 from typing import List
 
+import requests
 import streamlit as st
 from openai import OpenAI, OpenAIError
 
@@ -12,7 +14,14 @@ from caf_app.models import Campaign, ImageAsset
 from caf_app.storage import load_campaign, save_campaign
 
 
-client = OpenAI()  # Uses OPENAI_API_KEY from your environment
+# OpenAI client (uses OPENAI_API_KEY from .env)
+client = OpenAI()
+
+# Hugging Face NanoBanana config
+HF_API_KEY = os.getenv("HF_API_KEY")
+# TODO: set this to your actual NanoBanana model id from Hugging Face,
+# e.g. "your-username/your-nanobanana-model"
+HF_NANOBANANA_MODEL_ID = os.getenv("HF_NANOBANANA_MODEL_ID", "REPLACE_WITH_NANOBANANA_MODEL_ID")
 
 
 # ---- Helpers ---------------------------------------------------------------
@@ -24,7 +33,6 @@ def _get_current_slug() -> str | None:
 
 def _project_root() -> Path:
     # This file is at <root>/ui/pages/04_Image_Library.py
-    # So project root is two levels up
     return Path(__file__).resolve().parents[2]
 
 
@@ -54,48 +62,50 @@ def _default_image_prompt(campaign: Campaign) -> str:
     )
 
 
-def _generate_image_files(
+# ---- Engine-specific generators -------------------------------------------
+
+
+def _generate_with_openai(
     campaign: Campaign,
     prompt: str,
     engine: str,
     n_images: int,
-    size: str = "1024x1024",
+    size: str,
 ) -> List[ImageAsset]:
     """
-    Use OpenAI's image generation to create n_images and save to disk.
-    DALL·E 3: only supports n=1 and does not accept "n".
-    DALL·E 2: supports multiple images + "n".
+    Generate images using OpenAI's current image model (gpt-image-1).
+
+    We keep the 'engine' parameter for UI labeling and metadata,
+    but under the hood everything goes through gpt-image-1.
     """
     images_dir = _campaign_images_dir(campaign.slug)
 
-    # Backend guard: enforce DALL·E 3 limit
+    # Optionally keep the old DALL·E 3 guard, but it's not strictly needed:
     if engine == "dall-e-3" and n_images > 1:
         n_images = 1
 
     try:
-        if engine == "dall-e-3":
-            # DALL·E 3 request format (no n)
-            response = client.images.generate(
-                model="dall-e-3",
-                prompt=prompt,
-                size=size,
-            )
-        else:
-            # DALL·E 2 request format (supports n)
-            response = client.images.generate(
-                model="dall-e-2",
-                prompt=prompt,
-                n=n_images,
-                size=size,
-            )
-
+        # This matches your working testme.py call
+        response = client.images.generate(
+            model="gpt-image-1",
+            prompt=prompt,
+            n=n_images,
+            size=size,
+            output_format="png",
+        )
     except OpenAIError as e:
-        # Bubble a clean error up to Streamlit
-        raise RuntimeError(f"Error from OpenAI image API: {e}") from e
+        raise RuntimeError(f"OpenAI image generation failed: {e}") from e
 
+    # Decode the images and write them into the campaign's images dir
     assets: List[ImageAsset] = []
 
-    # response.data is a list of image results with b64_json
+    if not getattr(response, "data", None):
+        raise RuntimeError(
+            "OpenAI did not return any image data. "
+            "This usually means your project does not have image model access, "
+            "or the request violated a safety / quota limit."
+        )
+
     for idx, item in enumerate(response.data):
         b64_data = getattr(item, "b64_json", None)
         if not b64_data:
@@ -109,18 +119,56 @@ def _generate_image_files(
         with path.open("wb") as f:
             f.write(image_bytes)
 
-        # Store path relative to project root for portability
         rel_path = path.relative_to(_project_root())
 
         assets.append(
             ImageAsset(
                 path=str(rel_path),
-                engine=engine,
+                engine=engine,  # still records "dall-e-3" or "dall-e-2" for display
                 prompt=prompt,
             )
         )
 
+    if not assets:
+        raise RuntimeError(
+            "OpenAI returned a response but no usable image data. "
+            "Check logs and model access."
+        )
+
     return assets
+
+
+
+def _generate_image_files(
+    campaign: Campaign,
+    prompt: str,
+    engine: str,
+    n_images: int,
+    size: str = "1024x1024",
+) -> List[ImageAsset]:
+    """
+    Unified entry point: route to the appropriate backend based on engine.
+    engine:
+      - "dall-e-3"          -> OpenAI DALL·E 3
+      - "dall-e-2"          -> OpenAI DALL·E 2
+      - "nanobanana-hf"     -> NanoBanana on Hugging Face
+    """
+    if engine in ("dall-e-3", "dall-e-2"):
+        return _generate_with_openai(
+            campaign=campaign,
+            prompt=prompt,
+            engine=engine,
+            n_images=n_images,
+            size=size,
+        )
+    elif engine == "nanobanana-hf":
+        return _generate_with_nanobanana_hf(
+            campaign=campaign,
+            prompt=prompt,
+            n_images=n_images,
+        )
+    else:
+        raise RuntimeError(f"Unknown image engine: {engine}")
 
 
 # ---- Main UI ---------------------------------------------------------------
@@ -162,12 +210,24 @@ def main() -> None:
     with col2:
         engine = st.selectbox(
             "Engine",
-            options=["dall-e-3", "dall-e-2"],
+            options=["dall-e-3", "dall-e-2", "nanobanana-hf"],
             index=0,
-            help="OpenAI image engines. 'dall-e-3' only supports 1 image at a time.",
+            format_func=lambda v: {
+                "dall-e-3": "OpenAI – DALL·E 3",
+                "dall-e-2": "OpenAI – DALL·E 2",
+                "nanobanana-hf": "NanoBanana – Hugging Face",
+            }[v],
+            help="Choose which backend to use for image generation.",
         )
 
-        max_images = 1 if engine == "dall-e-3" else 8
+        # Per-engine limits
+        if engine == "dall-e-3":
+            max_images = 1
+        elif engine == "dall-e-2":
+            max_images = 8
+        else:  # nanobanana-hf
+            max_images = 4  # conservative default
+
         n_images = st.number_input(
             "Count",
             min_value=1,
@@ -177,18 +237,20 @@ def main() -> None:
         )
 
     with col3:
+        # Size options depend on engine
         if engine == "dall-e-3":
             size_options = ["1024x1024", "1024x1792", "1792x1024"]
-        else:
-            # DALL·E 2 supports these sizes in the new API
-            size_options = ["1024x1024", "512x512"]  # 512x512 is supported for dalle2
+        elif engine == "dall-e-2":
+            size_options = ["1024x1024", "512x512"]
+        else:  # nanobanana-hf
+            # Most SD-based models default to 512x512 or 1024x1024; we keep it simple for now
+            size_options = ["1024x1024"]
 
         size = st.selectbox(
             "Size",
             options=size_options,
             index=0,
         )
-
 
     if st.button("Generate images", type="primary"):
         if not prompt.strip():

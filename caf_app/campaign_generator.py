@@ -9,7 +9,11 @@ from typing import Dict, Any
 
 from caf_app.utils import slugify, ensure_campaign_dir, ensure_subdir
 from caf_app.text_gen import generate_campaign_texts
-from caf_app.image_gen import generate_campaign_images, ImageProvider
+from caf_app.image_gen import (
+    generate_evo_hero_image,
+    generate_evo_support_image,
+    ImageProvider,
+)
 
 
 @dataclass
@@ -36,7 +40,7 @@ def generate_campaign(
     - Slugify campaign name
     - Create campaign directory under campaigns/<slug>/
     - Generate text assets (tagline, slogans, etc.)
-    - Generate images (hero + 3 supporting) via selected provider
+    - Generate images (hero + supporting) via selected provider
     - Write all copy to disk
     - Save prompts used
     - Save metadata JSON
@@ -56,14 +60,29 @@ def generate_campaign(
     )
 
     # ---------- Image generation ----------
-    image_assets = generate_campaign_images(
-        brief=campaign_brief,
-        slug=slug,
-        campaign_dir=campaign_dir,
-        provider=image_provider,
+    # We generate into generated_images/ via image_gen.py,
+    # then copy into this campaign's images/ subfolder.
+
+    images_dir = ensure_subdir(campaign_dir, "images")
+
+    # Hero image
+    hero_tmp = generate_evo_hero_image(
+        campaign_brief,
+        filename=f"{slug}_hero.png",
     )
-    hero_path: Path = image_assets["hero_path"]
-    supporting_paths: list[Path] = image_assets["supporting_paths"]
+    hero_path: Path = images_dir / hero_tmp.name
+    shutil.copy(hero_tmp, hero_path)
+
+    # Supporting images (3 variants)
+    supporting_paths: list[Path] = []
+    for i in range(1, 4):
+        supp_tmp = generate_evo_support_image(
+            campaign_brief,
+            filename=f"{slug}_support_{i}.png",
+        )
+        supp_final = images_dir / supp_tmp.name
+        shutil.copy(supp_tmp, supp_final)
+        supporting_paths.append(supp_final)
 
     # ---------- Write copy files ----------
     copy_dir = ensure_subdir(campaign_dir, "copy")
@@ -141,3 +160,4 @@ def generate_campaign(
     }
 
     return result
+
