@@ -4,7 +4,7 @@ import base64
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from PIL import Image, ImageDraw
 
@@ -14,24 +14,72 @@ try:
 except ImportError:
     OpenAI = None
 
+# Use the new storage helpers so images live under campaigns/<slug>/images/...
+from .storage import (
+    ensure_campaign_image_folders,
+    write_image_metadata_json,
+    embed_metadata_in_image,
+)
+
 
 class ImageProvider(str, Enum):
     OPENAI = "openai"
     PLACEHOLDER = "placeholder"
 
 
-def _project_root() -> Path:
-    # assumes this file is at <root>/caf_app/image_gen.py
-    return Path(__file__).resolve().parents[1]
+# ---------- Internal helpers ----------
 
 
-def _images_dir() -> Path:
-    d = _project_root() / "generated_images"
+def _infer_slug_from_filename(filename: str) -> str:
+    """
+    Infer a campaign slug from a filename like 'evo-product-launch-1_hero.png'
+    -> 'evo-product-launch-1'.
+    If no underscore is present, uses the whole stem as slug.
+    """
+    stem = Path(filename).stem
+    parts = stem.split("_")
+    return parts[0] if parts else stem
+
+
+def _images_dir_for_slug(slug: str) -> Path:
+    """
+    Return the directory where generated images for this campaign should live:
+
+        campaigns/<slug>/images/generated/
+    """
+    base = ensure_campaign_image_folders(slug)  # campaigns/<slug>/images
+    d = base / "generated"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
+def _write_basic_metadata(
+    slug: str,
+    variant_label: str,
+    brief: str,
+    out_path: Path,
+    engine_name: str,
+) -> None:
+    """
+    Write a JSON sidecar and (optionally) embed alt_text into the image.
+    This is best-effort; failures are logged but not raised.
+    """
+    metadata: Dict[str, Any] = {
+        "campaign": slug,
+        "variant": variant_label,
+        "engine": engine_name,
+        "brief": brief,
+        "alt_text": f"{variant_label} image for campaign '{slug}'",
+    }
+    try:
+        write_image_metadata_json(out_path, metadata)
+        embed_metadata_in_image(out_path, metadata)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[image_gen] Warning: could not write metadata for {out_path}: {exc}")
+
+
 # ---------- Public API used by the app ----------
+
 
 def generate_evo_hero_image(brief: str, filename: str) -> Path:
     return _generate_evo_image(brief, "hero", filename)
@@ -51,24 +99,35 @@ def _generate_evo_image(
     filename: str,
     provider: ImageProvider = ImageProvider.OPENAI,
 ) -> Path:
-    images_dir = _images_dir()
+    """
+    Main entrypoint: chooses provider, routes to OpenAI or placeholder.
+
+    NOTE: We keep the old signature (brief + filename) for compatibility,
+    but now infer the campaign slug from the filename and save into:
+
+        campaigns/<slug>/images/generated/<filename>
+    """
+    slug = _infer_slug_from_filename(filename)
+    images_dir = _images_dir_for_slug(slug)
     out_path = images_dir / filename
 
     try:
         if provider == ImageProvider.OPENAI:
-            return _generate_openai_image(brief, variant_label, out_path)
+            return _generate_openai_image(brief, variant_label, slug, out_path)
         else:
-            return _generate_placeholder_image(variant_label, out_path)
-    except Exception as exc:
+            return _generate_placeholder_image(variant_label, slug, out_path)
+    except Exception as exc:  # noqa: BLE001
         print(f"[image_gen] Error using provider {provider}: {exc}")
-        return _generate_placeholder_image(variant_label, out_path)
+        return _generate_placeholder_image(variant_label, slug, out_path)
 
 
 # ---------- OpenAI provider (real API) ----------
 
+
 def _generate_openai_image(
     brief: str,
     variant_label: str,
+    slug: str,
     out_path: Path,
 ) -> Path:
     """
@@ -109,13 +168,20 @@ def _generate_openai_image(
     with open(out_path, "wb") as f:
         f.write(image_bytes)
 
+    _write_basic_metadata(slug, variant_label, brief, out_path, "openai-gpt-image-1")
+
     print(f"[image_gen] Saved OpenAI image to {out_path}")
     return out_path
 
 
 # ---------- Placeholder fallback ----------
 
-def _generate_placeholder_image(label: str, out_path: Path) -> Path:
+
+def _generate_placeholder_image(
+    label: str,
+    slug: str,
+    out_path: Path,
+) -> Path:
     img = Image.new("RGB", (1024, 1024), color=(180, 180, 180))
     draw = ImageDraw.Draw(img)
 
@@ -132,5 +198,8 @@ def _generate_placeholder_image(label: str, out_path: Path) -> Path:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path)
+
+    _write_basic_metadata(slug, label, f"Placeholder {label} asset", out_path, "placeholder")
+
     print(f"[image_gen] Saved placeholder image to {out_path}")
     return out_path

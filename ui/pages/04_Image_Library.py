@@ -14,8 +14,11 @@ from openai import OpenAI, OpenAIError
 from PIL import Image  # for converting uploads to PNG
 
 from caf_app.models import Campaign, ImageAsset
-from caf_app.storage import load_campaign, save_campaign
-
+from caf_app.storage import (
+    load_campaign,
+    save_campaign,
+    ensure_campaign_image_folders,  # NEW
+)
 
 # OpenAI client (uses OPENAI_API_KEY from .env)
 client = OpenAI()
@@ -52,8 +55,15 @@ def _project_root() -> Path:
 
 
 def _campaign_images_dir(slug: str) -> Path:
-    root = _project_root()
-    directory = root / "generated_images" / slug
+    """
+    New enterprise location for generated images:
+
+        campaigns/<slug>/images/generated/
+
+    This no longer writes into generated_images/<slug> directly.
+    """
+    images_base = ensure_campaign_image_folders(slug)  # campaigns/<slug>/images
+    directory = images_base / "generated"
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
@@ -66,7 +76,7 @@ def _import_uploaded_images(
     Save uploaded image files into this campaign's images directory
     as PNGs and return them as ImageAsset objects.
 
-    - Stores under: generated_images/<campaign.slug>/
+    - Stores under: campaigns/<slug>/images/generated/
     - Filenames: <slug>_upload_<N>.png
     - engine = "upload"
     """
@@ -932,4 +942,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
