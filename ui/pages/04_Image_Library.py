@@ -11,6 +11,7 @@ import shutil
 import requests
 import streamlit as st
 from openai import OpenAI, OpenAIError
+from PIL import Image  # NEW: for converting uploads to PNG
 
 from caf_app.models import Campaign, ImageAsset
 from caf_app.storage import load_campaign, save_campaign
@@ -19,10 +20,14 @@ from caf_app.storage import load_campaign, save_campaign
 # OpenAI client (uses OPENAI_API_KEY from .env)
 client = OpenAI()
 
-# Hugging Face NanoBanana config
+# Hugging Face config (NanoBanana + SDXL)
 HF_API_KEY = os.getenv("HF_API_KEY")
 HF_NANOBANANA_MODEL_ID = os.getenv(
     "HF_NANOBANANA_MODEL_ID", "REPLACE_WITH_NANOBANANA_MODEL_ID"
+)
+HF_SDXL_MODEL_ID = os.getenv(
+    "HF_SDXL_MODEL_ID",
+    "stabilityai/stable-diffusion-xl-base-1.0",
 )
 
 # Adobe Firefly config (OAuth server-to-server)
@@ -348,6 +353,78 @@ def _generate_with_nanobanana_hf(
     return assets
 
 
+def _generate_with_sdxl_hf(
+    campaign: Campaign,
+    prompt: str,
+    n_images: int,
+) -> List[ImageAsset]:
+    """
+    Generate images using Stable Diffusion XL hosted on Hugging Face.
+
+    Uses:
+      HF_API_KEY       -> Hugging Face access token
+      HF_SDXL_MODEL_ID -> e.g. 'stabilityai/stable-diffusion-xl-base-1.0'
+    """
+    if not HF_API_KEY or not HF_SDXL_MODEL_ID:
+        raise RuntimeError(
+            "Stable Diffusion XL (Hugging Face) is not configured. "
+            "Set HF_API_KEY and HF_SDXL_MODEL_ID in your environment."
+        )
+
+    api_url = f"https://router.huggingface.co/hf-inference/models/{HF_SDXL_MODEL_ID}"
+    headers = {
+        "Authorization": f"Bearer {HF_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "image/png",
+    }
+
+    images_dir = _campaign_images_dir(campaign.slug)
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    assets: List[ImageAsset] = []
+
+    for idx in range(n_images):
+        payload = {"inputs": prompt}
+
+        try:
+            response = requests.post(
+                api_url,
+                headers=headers,
+                json=payload,
+                timeout=120,
+            )
+        except requests.RequestException as e:
+            raise RuntimeError(f"SDXL HF request failed: {e}") from e
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"SDXL HF generation failed ({response.status_code}): "
+                f"{response.text[:500]}"
+            )
+
+        image_bytes = response.content
+
+        filename = (
+            f"{campaign.slug}_sdxl_{len(campaign.image_assets) + idx + 1}.png"
+        )
+        path = images_dir / filename
+
+        with path.open("wb") as f:
+            f.write(image_bytes)
+
+        rel_path = path.relative_to(_project_root())
+
+        assets.append(
+            ImageAsset(
+                path=str(rel_path),
+                engine="sdxl-hf",
+                prompt=prompt,
+            )
+        )
+
+    return assets
+
+
 def _generate_with_firefly(
     campaign: Campaign,
     prompt: str,
@@ -462,8 +539,10 @@ def _generate_image_files(
       - "dall-e-3"          -> OpenAI DALL·E 3
       - "dall-e-2"          -> OpenAI DALL·E 2
       - "nanobanana-hf"     -> NanoBanana on Hugging Face
+      - "sdxl-hf"           -> Stable Diffusion XL on Hugging Face
       - "firefly"           -> Adobe Firefly
     """
+
     if engine in ("dall-e-3", "dall-e-2"):
         return _generate_with_openai(
             campaign=campaign,
@@ -474,6 +553,12 @@ def _generate_image_files(
         )
     elif engine == "nanobanana-hf":
         return _generate_with_nanobanana_hf(
+            campaign=campaign,
+            prompt=prompt,
+            n_images=n_images,
+        )
+    elif engine == "sdxl-hf":
+        return _generate_with_sdxl_hf(
             campaign=campaign,
             prompt=prompt,
             n_images=n_images,
@@ -558,25 +643,26 @@ def main() -> None:
     with col2:
         engine = st.selectbox(
             "Engine",
-            options=["dall-e-3", "dall-e-2", "nanobanana-hf", "firefly"],
+            options=["dall-e-3", "dall-e-2", "nanobanana-hf", "sdxl-hf", "firefly"],
             index=0,
             format_func=lambda v: {
                 "dall-e-3": "OpenAI – DALL·E 3",
                 "dall-e-2": "OpenAI – DALL·E 2",
                 "nanobanana-hf": "NanoBanana – Hugging Face",
+                "sdxl-hf": "Stable Diffusion XL – Hugging Face",
                 "firefly": "Adobe Firefly",
             }[v],
             help="Choose which backend to use for image generation.",
         )
 
-        # Per-engine limits
+        # Per-engine limits (matches your prior behavior, with SDXL same as NanoBanana)
         if engine == "dall-e-3":
-            max_images = 4
+            max_images = 2
         elif engine == "dall-e-2":
             max_images = 8
         elif engine == "firefly":
             max_images = 4
-        else:  # nanobanana-hf
+        else:  # nanobanana-hf or sdxl-hf
             max_images = 4  # conservative default
 
         n_images = st.number_input(
@@ -596,7 +682,7 @@ def main() -> None:
         elif engine == "firefly":
             # Firefly uses separate width/height fields, but we keep the same string format
             size_options = ["1024x1024", "2048x2048"]
-        else:  # nanobanana-hf
+        else:  # nanobanana-hf or sdxl-hf
             size_options = ["1024x1024"]
 
         size = st.selectbox(

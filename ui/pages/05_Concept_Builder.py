@@ -8,9 +8,11 @@ from datetime import datetime
 import streamlit as st
 
 from caf_app.models import Campaign, Concept, ImageAsset, TextAsset
-from caf_app.storage import load_campaign, save_campaign
-
-
+from caf_app.storage import (
+    load_campaign,
+    save_campaign,
+    _project_root as _storage_project_root,
+)
 
 
 # ---- Helpers ---------------------------------------------------------------
@@ -21,7 +23,12 @@ def _get_current_slug() -> str | None:
 
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    """
+    Use the SAME project root definition as storage.py so that
+    asset.path values (e.g. 'generated_images/slug/file.png')
+    resolve correctly everywhere (Image Library, Concept Builder, etc.).
+    """
+    return _storage_project_root()
 
 
 def _find_image(asset_list: List[ImageAsset], asset_id: str) -> Optional[ImageAsset]:
