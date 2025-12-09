@@ -11,7 +11,7 @@ import shutil
 import requests
 import streamlit as st
 from openai import OpenAI, OpenAIError
-from PIL import Image  # NEW: for converting uploads to PNG
+from PIL import Image  # for converting uploads to PNG
 
 from caf_app.models import Campaign, ImageAsset
 from caf_app.storage import load_campaign, save_campaign
@@ -56,6 +56,59 @@ def _campaign_images_dir(slug: str) -> Path:
     directory = root / "generated_images" / slug
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def _import_uploaded_images(
+    campaign: Campaign,
+    uploaded_files: list,
+) -> List[ImageAsset]:
+    """
+    Save uploaded image files into this campaign's images directory
+    as PNGs and return them as ImageAsset objects.
+
+    - Stores under: generated_images/<campaign.slug>/
+    - Filenames: <slug>_upload_<N>.png
+    - engine = "upload"
+    """
+    images_dir = _campaign_images_dir(campaign.slug)
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_count = len(campaign.image_assets)
+    created: List[ImageAsset] = []
+    next_index = 1
+
+    for uploaded in uploaded_files:
+        suffix = Path(uploaded.name).suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+            st.warning(f"Skipping {uploaded.name} (unsupported file type).")
+            continue
+
+        try:
+            img = Image.open(uploaded)
+        except Exception as e:
+            st.warning(f"Could not open {uploaded.name}: {e}")
+            continue
+
+        filename = f"{campaign.slug}_upload_{existing_count + next_index}.png"
+        path = images_dir / filename
+
+        try:
+            img.save(path, format="PNG")
+        except Exception as e:
+            st.warning(f"Failed to save {uploaded.name} as PNG: {e}")
+            continue
+
+        rel_path = path.relative_to(_project_root())
+        created.append(
+            ImageAsset(
+                path=str(rel_path),
+                engine="upload",
+                prompt=f"Uploaded from {uploaded.name}",
+            )
+        )
+        next_index += 1
+
+    return created
 
 
 def _default_image_prompt(campaign: Campaign) -> str:
@@ -612,116 +665,143 @@ def main() -> None:
             st.session_state.pop("pinned_image", None)
 
     # --- Generation controls -------------------------------------------------
-    st.markdown("### Generate new images")
+    with st.expander("➕ Generate new images", expanded=False):
 
-    col1, col2, col3 = st.columns([3, 1, 1])
+        st.markdown("### Generate new images")
 
-    with col1:
-        default_prompt = _default_image_prompt(campaign)
-        prompt = st.text_area(
-            "Image prompt",
-            value=default_prompt,
-            height=120,
-        )
+        col1, col2, col3 = st.columns([3, 1, 1])
 
-        # Optional: use pinned image as template
-        use_pinned_template = False
-        if pinned_path:
-            st.info(
-                "A pinned image is available. You can use it as a base/template "
-                "for the new images."
-            )
-            use_pinned_template = st.checkbox(
-                "Use pinned image as template",
-                value=False,
-                help=(
-                    "When enabled, new images will be derived from the pinned image "
-                    "instead of purely from the text prompt."
-                ),
+        with col1:
+            default_prompt = _default_image_prompt(campaign)
+            prompt = st.text_area(
+                "Image prompt",
+                value=default_prompt,
+                height=120,
             )
 
-    with col2:
-        engine = st.selectbox(
-            "Engine",
-            options=["dall-e-3", "dall-e-2", "nanobanana-hf", "sdxl-hf", "firefly"],
-            index=0,
-            format_func=lambda v: {
-                "dall-e-3": "OpenAI – DALL·E 3",
-                "dall-e-2": "OpenAI – DALL·E 2",
-                "nanobanana-hf": "NanoBanana – Hugging Face",
-                "sdxl-hf": "Stable Diffusion XL – Hugging Face",
-                "firefly": "Adobe Firefly",
-            }[v],
-            help="Choose which backend to use for image generation.",
+            # Optional: use pinned image as template
+            use_pinned_template = False
+            if pinned_path:
+                st.info(
+                    "A pinned image is available. You can use it as a base/template "
+                    "for the new images."
+                )
+                use_pinned_template = st.checkbox(
+                    "Use pinned image as template",
+                    value=False,
+                    help=(
+                        "When enabled, new images will be derived from the pinned image "
+                        "instead of purely from the text prompt."
+                    ),
+                )
+
+        with col2:
+            engine = st.selectbox(
+                "Engine",
+                options=["dall-e-3", "dall-e-2", "nanobanana-hf", "sdxl-hf", "firefly"],
+                index=0,
+                format_func=lambda v: {
+                    "dall-e-3": "OpenAI – DALL·E 3",
+                    "dall-e-2": "OpenAI – DALL·E 2",
+                    "nanobanana-hf": "NanoBanana – Hugging Face",
+                    "sdxl-hf": "Stable Diffusion XL – Hugging Face",
+                    "firefly": "Adobe Firefly",
+                }[v],
+                help="Choose which backend to use for image generation.",
+            )
+
+            # Per-engine limits (matches your prior behavior, with SDXL same as NanoBanana)
+            if engine == "dall-e-3":
+                max_images = 2
+            elif engine == "dall-e-2":
+                max_images = 8
+            elif engine == "firefly":
+                max_images = 4
+            else:  # nanobanana-hf or sdxl-hf
+                max_images = 4  # conservative default
+
+            n_images = st.number_input(
+                "Count",
+                min_value=1,
+                max_value=max_images,
+                value=min(4, max_images),
+                step=1,
+            )
+
+        with col3:
+            # Size options depend on engine
+            if engine == "dall-e-3":
+                size_options = ["1024x1024", "1024x1792", "1792x1024"]
+            elif engine == "dall-e-2":
+                size_options = ["1024x1024", "512x512"]
+            elif engine == "firefly":
+                # Firefly uses separate width/height fields, but we keep the same string format
+                size_options = ["1024x1024", "2048x2048"]
+            else:  # nanobanana-hf or sdxl-hf
+                size_options = ["1024x1024"]
+
+            size = st.selectbox(
+                "Size",
+                options=size_options,
+                index=0,
+            )
+
+        if st.button("Generate images", type="primary"):
+            if not prompt.strip():
+                st.warning("Please enter an image prompt.")
+            else:
+                try:
+                    with st.spinner("Generating images..."):
+                        # If user chose to use the pinned image as a template and one exists,
+                        # route through the pinned-image helper.
+                        if pinned_path and use_pinned_template:
+                            new_assets = _generate_images_from_pinned(
+                                campaign=campaign,
+                                pinned_path=Path(pinned_path),
+                                prompt=prompt.strip(),
+                                n_images=int(n_images),
+                            )
+                        else:
+                            new_assets = _generate_image_files(
+                                campaign=campaign,
+                                prompt=prompt.strip(),
+                                engine=engine,
+                                n_images=int(n_images),
+                                size=size,
+                            )
+
+                        campaign.image_assets.extend(new_assets)
+                        save_campaign(campaign)
+
+                    st.success(f"Added {len(new_assets)} new images to this campaign.")
+                    st.rerun()
+                except RuntimeError as e:
+                    st.error(str(e))
+
+    # --- Import existing images --------------------------------------------
+    st.markdown("### Import existing images")
+
+    with st.expander("Upload images from your computer"):
+        uploaded_files = st.file_uploader(
+            "Select image files to import",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
         )
 
-        # Per-engine limits (matches your prior behavior, with SDXL same as NanoBanana)
-        if engine == "dall-e-3":
-            max_images = 2
-        elif engine == "dall-e-2":
-            max_images = 8
-        elif engine == "firefly":
-            max_images = 4
-        else:  # nanobanana-hf or sdxl-hf
-            max_images = 4  # conservative default
+        if uploaded_files and st.button(
+            "Add to image library",
+            type="secondary",
+        ):
+            with st.spinner("Importing images..."):
+                new_assets = _import_uploaded_images(campaign, uploaded_files)
 
-        n_images = st.number_input(
-            "Count",
-            min_value=1,
-            max_value=max_images,
-            value=min(4, max_images),
-            step=1,
-        )
-
-    with col3:
-        # Size options depend on engine
-        if engine == "dall-e-3":
-            size_options = ["1024x1024", "1024x1792", "1792x1024"]
-        elif engine == "dall-e-2":
-            size_options = ["1024x1024", "512x512"]
-        elif engine == "firefly":
-            # Firefly uses separate width/height fields, but we keep the same string format
-            size_options = ["1024x1024", "2048x2048"]
-        else:  # nanobanana-hf or sdxl-hf
-            size_options = ["1024x1024"]
-
-        size = st.selectbox(
-            "Size",
-            options=size_options,
-            index=0,
-        )
-
-    if st.button("Generate images", type="primary"):
-        if not prompt.strip():
-            st.warning("Please enter an image prompt.")
-        else:
-            try:
-                with st.spinner("Generating images..."):
-                    # If user chose to use the pinned image as a template and one exists,
-                    # route through the pinned-image helper.
-                    if pinned_path and use_pinned_template:
-                        new_assets = _generate_images_from_pinned(
-                            campaign=campaign,
-                            pinned_path=Path(pinned_path),
-                            prompt=prompt.strip(),
-                            n_images=int(n_images),
-                        )
-                    else:
-                        new_assets = _generate_image_files(
-                            campaign=campaign,
-                            prompt=prompt.strip(),
-                            engine=engine,
-                            n_images=int(n_images),
-                            size=size,
-                        )
-
+                if new_assets:
                     campaign.image_assets.extend(new_assets)
                     save_campaign(campaign)
-
-                st.success(f"Added {len(new_assets)} new images to this campaign.")
-                st.rerun()
-            except RuntimeError as e:
-                st.error(str(e))
+                    st.success(f"Imported {len(new_assets)} image(s) into this campaign.")
+                    st.rerun()
+                else:
+                    st.info("No images were imported. Check file types and try again.")
 
     st.markdown("---")
 
@@ -769,10 +849,35 @@ def main() -> None:
             image_path = _project_root() / asset.path
             st.image(str(image_path), use_container_width=True)
 
-            st.caption(f"Engine: `{asset.engine}`")
-            if asset.prompt:
-                with st.expander("Prompt"):
-                    st.write(asset.prompt)
+            label = f"Engine: `{asset.engine}`"
+            if asset.engine == "upload":
+                label += " · Imported"
+            st.caption(label)
+
+            # Download + Edit in Firefly row (non-destructive)
+            dl_col, firefly_col = st.columns(2)
+
+            with dl_col:
+                try:
+                    with open(image_path, "rb") as f:
+                        img_bytes = f.read()
+                    st.download_button(
+                        "Download",
+                        data=img_bytes,
+                        file_name=Path(asset.path).name,
+                        mime="image/png",
+                        key=f"dl_{asset.id}",
+                    )
+                except Exception:
+                    st.write("")
+
+            with firefly_col:
+                # Simple link that opens Firefly in a new tab
+                st.markdown(
+                    '<a href="https://firefly.adobe.com" target="_blank">'
+                    'Edit in Firefly</a>',
+                    unsafe_allow_html=True,
+                )
 
             # --- Favorite + Pin + Delete controls ---
             col_fav, col_pin, col_del = st.columns([3, 2, 1])
@@ -795,6 +900,7 @@ def main() -> None:
             # Delete image
             with col_del:
                 if st.button("🗑", key=f"del_img_{asset.id}", help="Delete this image"):
+                    # Resolve full absolute path
                     img_path = Path(asset.path)
                     if not img_path.is_absolute():
                         try:
@@ -802,14 +908,23 @@ def main() -> None:
                         except NameError:
                             img_path = Path.cwd() / img_path
 
+                    # Ensure the file is not held open (important for Pillow/macOS)
+                    try:
+                        img = Image.open(img_path)
+                        img.close()
+                    except Exception:
+                        # If it can't be opened, that's fine — still attempt delete
+                        pass
+
+                    # Delete the file
                     try:
                         img_path.unlink(missing_ok=True)
                     except Exception as e:
                         st.error(f"Failed to delete file: {e}")
                     else:
+                        # Remove from campaign list and save
                         campaign.image_assets = [
-                            a for a in campaign.image_assets
-                            if a.id != asset.id
+                            a for a in campaign.image_assets if a.id != asset.id
                         ]
                         save_campaign(campaign)
                         st.rerun()
@@ -817,3 +932,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
