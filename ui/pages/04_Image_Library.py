@@ -1,449 +1,766 @@
 # ui/pages/04_Image_Library.py
 from __future__ import annotations
-
 import base64
-import json
+import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List
-
+from typing import List, Tuple
+import shutil
+import requests
 import streamlit as st
-from PIL import Image
 from openai import OpenAI, OpenAIError
+import io
+from huggingface_hub import InferenceClient
+from caf_app.storage import load_campaign
+from caf_app.models import Campaign  # imported for type hints / future use
+import io
+import zipfile
+import json
+from PIL import Image
 
-from caf_app.storage import campaigns_dir, load_campaign
-from caf_app.image_gen import generate_image, save_png, make_firefly_edit_url
+# ---------------------------------------------------------------------------
+# Config / clients
+# ---------------------------------------------------------------------------
 
-# OpenAI client (uses OPENAI_API_KEY from .env)
 client = OpenAI()
 
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
+HF_API_KEY = os.getenv("HF_API_KEY")
+HF_NANOBANANA_MODEL_ID = os.getenv("HF_NANOBANANA_MODEL_ID")
 
 # ---------------------------------------------------------------------------
 # Path helpers
 # ---------------------------------------------------------------------------
 
-def _get_current_slug() -> str | None:
-    return st.session_state.get("current_campaign_slug")
+
+def _project_root() -> Path:
+    """
+    Return the project root directory (one level above /ui).
+    This file lives at <root>/ui/pages/04_Image_Library.py
+    """
+    return Path(__file__).resolve().parents[2]
 
 
-def _campaign_dir(slug: str) -> Path:
-    return campaigns_dir() / slug
+def _campaigns_root() -> Path:
+    root = _project_root()
+    campaigns = root / "campaigns"
+    campaigns.mkdir(parents=True, exist_ok=True)
+    return campaigns
+
+def _metadata_path(slug: str) -> Path:
+    """
+    JSON file that tracks pinned / favorite status per image for this campaign.
+    """
+    base = _campaigns_root() / slug
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "image_metadata.json"
 
 
-def _images_base_dir(slug: str) -> Path:
-    return _campaign_dir(slug) / "images"
-
-
-def _generated_dir(slug: str) -> Path:
-    return _images_base_dir(slug) / "generated"
-
-
-def _uploads_dir(slug: str) -> Path:
-    return _images_base_dir(slug) / "uploads"
-
-
-def _ensure_dirs(slug: str) -> None:
-    for p in (_generated_dir(slug), _uploads_dir(slug)):
-        p.mkdir(parents=True, exist_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# Pin / favorite metadata
-# ---------------------------------------------------------------------------
-
-def _meta_path(slug: str) -> Path:
-    return _images_base_dir(slug) / "images_meta.json"
-
-
-def _load_meta(slug: str) -> Dict[str, Dict[str, Any]]:
-    mp = _meta_path(slug)
-    if not mp.exists():
+def _load_image_metadata(slug: str) -> dict:
+    """
+    Load image metadata for a campaign, keyed by filename.
+    Example:
+        {
+          "123456.png": {"pinned": true, "favorite": false},
+          ...
+        }
+    """
+    path = _metadata_path(slug)
+    if not path.exists():
         return {}
     try:
-        with mp.open("r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception:
+        # If anything goes wrong, fall back to empty metadata rather than dying.
         return {}
 
 
-def _save_meta(slug: str, meta: Dict[str, Dict[str, Any]]) -> None:
-    mp = _meta_path(slug)
-    mp.parent.mkdir(parents=True, exist_ok=True)
-    with mp.open("w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# List images + meta
-# ---------------------------------------------------------------------------
-
-def _list_images_with_meta(slug: str) -> List[Dict[str, Any]]:
-    meta = _load_meta(slug)
-    items: List[Dict[str, Any]] = []
-
-    sections = [
-        ("generated", _generated_dir),
-        ("uploads", _uploads_dir),
-    ]
-    exts = ("*.png", "*.jpg", "*.jpeg")
-
-    for section_name, dir_fn in sections:
-        d = dir_fn(slug)
-        if not d.exists():
-            continue
-        for pattern in exts:
-            for p in sorted(d.glob(pattern)):
-                filename = p.name
-                entry_meta = meta.get(filename, {})
-                items.append(
-                    {
-                        "path": p,
-                        "section": section_name,
-                        "pinned": bool(entry_meta.get("pinned", False)),
-                        "favorite": bool(entry_meta.get("favorite", False)),
-                    }
-                )
-
-    # Sort: pinned → favorite → filename
-    items.sort(
-        key=lambda x: (
-            0 if x["pinned"] else 1,
-            0 if x["favorite"] else 1,
-            x["path"].name.lower(),
-        )
-    )
-    return items
-
-
-# ---------------------------------------------------------------------------
-# OpenAI exact edit helper (gpt-image-1) — matches official Python example
-# ---------------------------------------------------------------------------
-
-def _edit_image_with_openai(
-    template_path: Path,
-    prompt: str,
-    size: str = "1024x1024",
-) -> bytes:
+def _save_image_metadata(slug: str, metadata: dict) -> None:
     """
-    True in-place edit using OpenAI's image edit API.
-
-    This is what gives you: "same image, but now with a top hat / balloon / worker".
+    Persist image metadata to disk.
     """
-    try:
-        # Important: pass image as a LIST of file handles, like the docs
-        with template_path.open("rb") as f:
-            result = client.images.edit(
-                model="gpt-image-1",
-                image=[f],
-                prompt=prompt,
-                size=size,
-                n=1,
+    path = _metadata_path(slug)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def _get_current_slug() -> str | None:
+    """
+    The Dashboard / other pages should set:
+        st.session_state["current_campaign_slug"]
+    """
+    return st.session_state.get("current_campaign_slug")
+
+
+def _campaign_dirs(slug: str) -> Tuple[Path, Path]:
+    """
+    Returns (images_dir, generated_dir) for a campaign.
+    """
+    base = _campaigns_root() / slug
+    images_dir = base / "images"
+    generated_dir = images_dir / "generated"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    return images_dir, generated_dir
+
+
+def _list_all_images(slug: str) -> List[Path]:
+    """
+    Return all images (uploaded + generated) for a campaign as Paths,
+    sorted newest-first by modification time.
+    """
+    images_dir, generated_dir = _campaign_dirs(slug)
+
+    paths: List[Path] = []
+    for directory in (images_dir, generated_dir):
+        if directory.exists():
+            for ext in ("*.png", "*.jpg", "*.jpeg", "*.webp"):
+                paths.extend(directory.glob(ext))
+
+    # Deduplicate and sort
+    unique = list({p.resolve(): p for p in paths}.values())
+    unique.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return unique
+
+
+# ---------------------------------------------------------------------------
+# Engine helpers
+# ---------------------------------------------------------------------------
+
+def _stability_variants_from_base(
+    base_image_path: Path,
+    instructions: str,
+    n_images: int,
+) -> List[bytes]:
+    """
+    Use Stability's edit/inpaint endpoint to generate variants starting from
+    a base image. This tends to preserve more of the original structure than
+    pure text-to-image.
+    """
+    if not STABILITY_API_KEY:
+        raise RuntimeError("STABILITY_API_KEY is not set in the environment.")
+
+    url = "https://api.stability.ai/v2beta/stable-image/edit/inpaint"
+    headers = {
+        "Authorization": f"Bearer {STABILITY_API_KEY}",
+        "Accept": "image/*",
+    }
+
+    # Full-white mask: allow edits anywhere, but diffusion still starts from the base.
+    base = Image.open(base_image_path).convert("RGBA")
+    mask = Image.new("L", base.size, color=255)
+    mask_buf = io.BytesIO()
+    mask.save(mask_buf, format="PNG")
+    mask_bytes = mask_buf.getvalue()
+
+    images: List[bytes] = []
+
+    for _ in range(n_images):
+        with open(base_image_path, "rb") as f:
+            files = {
+                "image": ("image.png", f, "image/png"),
+                "mask": ("mask.png", mask_bytes, "image/png"),
+            }
+            data = {
+                "prompt": instructions,
+                "output_format": "png",
+            }
+
+            resp = requests.post(
+                url,
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=120,
             )
 
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Stability edit failed: {resp.status_code} {resp.text[:500]}"
+            )
+
+        images.append(resp.content)
+
+    return images
+
+def _openai_variants_from_base(
+    base_image_path: Path,
+    instructions: str,
+    n_images: int,
+) -> List[bytes]:
+    """
+    Use OpenAI's image edit API (gpt-image-1) to generate variants that
+    preserve the original image as much as possible while applying the
+    requested improvements.
+    """
+    images: List[bytes] = []
+
+    for _ in range(n_images):
+        with open(base_image_path, "rb") as f:
+            try:
+                result = client.images.edit(
+                    model="gpt-image-1",
+                    image=f,              # 👈 single image file object
+                    prompt=instructions,
+                    n=1,
+                    size="1024x1024",
+                )
+            except OpenAIError as e:
+                raise RuntimeError(f"OpenAI variant edit failed: {e}") from e
+
+        # gpt-image-1 always returns base64
         b64 = result.data[0].b64_json
-        return base64.b64decode(b64)
+        images.append(base64.b64decode(b64))
 
+    return images
+
+
+def _generate_openai_images(prompt: str, n_images: int) -> List[bytes]:
+    if n_images < 1:
+        return []
+
+    try:
+        response = client.images.generate(
+            model="gpt-image-1",
+            prompt=prompt,
+            n=n_images,
+            size="1024x1024",
+            # NOTE: no response_format param to avoid the 400 unknown_parameter error
+        )
     except OpenAIError as e:
-        raise RuntimeError(f"OpenAI image edit failed: {e}") from e
-    except Exception as e:
-        raise RuntimeError(f"Unexpected error in image edit: {e}") from e
+        raise RuntimeError(f"OpenAI image generation failed: {e}") from e
+
+    images: List[bytes] = []
+    for item in response.data:
+        b64 = item.b64_json
+        images.append(base64.b64decode(b64))
+    return images
+
+def _generate_stability_images(prompt: str, n_images: int) -> List[bytes]:
+    if not STABILITY_API_KEY:
+        raise RuntimeError("STABILITY_API_KEY is not set in the environment.")
+
+    url = "https://api.stability.ai/v2beta/stable-image/generate/core"
+    headers = {
+        "Authorization": f"Bearer {STABILITY_API_KEY}",
+        # Stability requires an explicit Accept header: image/* or application/json
+        "Accept": "image/*",
+    }
+
+    images: List[bytes] = []
+    for _ in range(n_images):
+        files = {
+            "prompt": (None, prompt),
+            "output_format": (None, "png"),
+        }
+        resp = requests.post(url, headers=headers, files=files, timeout=120)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Stability API error {resp.status_code}: {resp.text[:500]}"
+            )
+        images.append(resp.content)
+    return images
+
+
+
+def _generate_nanobanana_images(prompt: str, n_images: int) -> List[bytes]:
+    """
+    NanoBanana / FLUX via Hugging Face InferenceClient.
+
+    Uses HF_API_KEY as the token and HF_NANOBANANA_MODEL_ID as the model id,
+    e.g. "black-forest-labs/FLUX.1-dev".
+    """
+    if not HF_API_KEY:
+        raise RuntimeError("HF_API_KEY is not set in the environment.")
+
+    if not HF_NANOBANANA_MODEL_ID or "REPLACE_WITH" in HF_NANOBANANA_MODEL_ID:
+        raise RuntimeError(
+            "HF_NANOBANANA_MODEL_ID is not configured. "
+            "Set it to your actual model id on Hugging Face, e.g. 'black-forest-labs/FLUX.1-dev'."
+        )
+
+    client = InferenceClient(api_key=HF_API_KEY)
+
+    images: List[bytes] = []
+    for _ in range(n_images):
+        # This returns a PIL.Image
+        img = client.text_to_image(
+            prompt=prompt,
+            model=HF_NANOBANANA_MODEL_ID,
+        )
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        images.append(buf.getvalue())
+
+    return images
+
+
+def _generate_images_for_engine(
+    engine: str, prompt: str, n_images: int
+) -> List[bytes]:
+    engine = engine.lower()
+    if engine == "openai":
+        return _generate_openai_images(prompt, n_images)
+    elif engine == "stability":
+        return _generate_stability_images(prompt, n_images)
+    elif engine == "nanobanana":
+        return _generate_nanobanana_images(prompt, n_images)
+    else:
+        raise ValueError(f"Unknown engine: {engine}")
+
+def _generate_variants_for_engine(
+    engine: str,
+    base_image_path: Path,
+    instructions: str,
+    n_images: int,
+) -> List[bytes]:
+    """
+    For now, only OpenAI is used for true image edits.
+    """
+    engine = engine.lower()
+    if engine != "openai":
+        raise RuntimeError("Variant-from-base currently supports only OpenAI image edits.")
+    return _openai_variants_from_base(base_image_path, instructions, n_images)
+
+
+    # Fallback for stability / nanobanana: treat as “inspired by base”
+    base_hint = (
+        "Create a new image inspired by a reference image, preserving the main subject and "
+        f"overall composition, but applying the following changes: {instructions.strip()}"
+    )
+    return _generate_images_for_engine(engine, base_hint, n_images)
 
 
 # ---------------------------------------------------------------------------
-# Main Streamlit page
+# Storage helpers for generated / uploaded images
 # ---------------------------------------------------------------------------
 
-def main():
+
+def _save_image_bytes(slug: str, img_bytes: bytes, generated: bool = True) -> Path:
+    """
+    Save image bytes into the campaign folder and return the Path.
+    If generated=True, save under images/generated; else under images/.
+    """
+    images_dir, generated_dir = _campaign_dirs(slug)
+    target_dir = generated_dir if generated else images_dir
+
+    ts = int(time.time() * 1000)
+    filename = f"{ts}.png"
+    path = target_dir / filename
+
+    with open(path, "wb") as f:
+        f.write(img_bytes)
+
+    return path
+
+
+def _save_uploaded_image(slug: str, uploaded_file) -> Path:
+    """
+    Save an uploaded image into the base images dir (not generated).
+    """
+    images_dir, _ = _campaign_dirs(slug)
+    suffix = Path(uploaded_file.name).suffix or ".png"
+    ts = int(time.time() * 1000)
+    filename = f"uploaded_{ts}{suffix}"
+    dest = images_dir / filename
+    with open(dest, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return dest
+
+
+# ---------------------------------------------------------------------------
+# UI sections
+# ---------------------------------------------------------------------------
+def _render_tools_panel(slug: str) -> None:
+    """
+    Compact wrapper that puts all the 'tool' sections behind a single expander
+    with tabs, so the top of the page stays small.
+    """
+    with st.expander(
+        "Tools: upload / generate / variants / export",
+        expanded=False,
+    ):
+        tabs = st.tabs(
+            [
+                "Upload external images",
+                "Generate from prompt",
+                "Variants from base",
+                "Export images",
+            ]
+        )
+
+        with tabs[0]:
+            _render_upload_section(slug)
+
+        with tabs[1]:
+            _render_prompt_generation_ui(slug)
+
+        with tabs[2]:
+            _render_variant_generation_ui(slug)
+
+        with tabs[3]:
+            _render_export_section(slug)
+
+
+def _render_campaign_header(slug: str) -> None:
+    campaign = load_campaign(slug)
+
+    # If campaign couldn't be loaded, don't crash the page.
+    if campaign is None:
+        st.warning(f"Could not load campaign for slug '{slug}'. "
+                   "It may have been deleted or the JSON file is missing.")
+        return
+
+    # Try to find a reasonable name/title field
+    name = None
+    for attr in ("name", "title", "campaign_name"):
+        if hasattr(campaign, attr):
+            name = getattr(campaign, attr)
+            break
+
+    if not name and isinstance(getattr(campaign, "model_dump", None), callable):
+        data = campaign.model_dump()
+        for key in ("name", "title", "campaign_name"):
+            if key in data and data[key]:
+                name = data[key]
+                break
+
+    if not name:
+        name = slug
+
+    st.subheader(f"Campaign: {name}")
+
+    # --- brief / description (same defensive pattern) ---
+    brief = None
+    for attr in ("campaign_brief", "brief", "description", "summary"):
+        if hasattr(campaign, attr):
+            brief = getattr(campaign, attr)
+            break
+
+    if brief is None and isinstance(getattr(campaign, "model_dump", None), callable):
+        data = campaign.model_dump()
+        for key in ("campaign_brief", "brief", "description", "summary"):
+            if key in data and data[key]:
+                brief = data[key]
+                break
+
+    if brief:
+        with st.expander("View campaign brief", expanded=False):
+            st.write(brief)
+
+
+def _render_upload_section(slug: str) -> None:
+    st.markdown("### ⬆️ Upload External Images")
+
+    uploaded_files = st.file_uploader(
+        "Upload one or more images",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        help="These images will appear in the gallery below. You can pin any of them and then use pinned images as bases for variants.",
+    )
+
+    if uploaded_files:
+        if st.button("Save uploaded images"):
+            count = 0
+            for f in uploaded_files:
+                _save_uploaded_image(slug, f)
+                count += 1
+            st.success(f"Saved {count} image(s). They now appear in the gallery.")
+            st.rerun()
+
+
+def _render_prompt_generation_ui(slug: str) -> None:
+    st.markdown("### 🎨 Generate Images From Prompt")
+
+    with st.expander("Open generator", expanded=False):
+        prompt = st.text_area(
+            "Prompt",
+            placeholder="Describe the image you want to generate…",
+            height=120,
+        )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            engine = st.selectbox(
+                "Engine",
+                ["stability", "openai", "nanobanana"],
+                index=0,
+                help="Which image engine to use.",
+            )
+        with col2:
+            n_images = st.slider(
+                "Number of images",
+                min_value=1,
+                max_value=6,
+                value=2,
+            )
+        with col3:
+            size = st.selectbox(
+                "Size (ignored by some engines)",
+                ["1024x1024", "768x768"],
+                index=0,
+            )
+
+        if st.button("Generate images", type="primary"):
+            if not prompt.strip():
+                st.warning("Please enter a prompt.")
+                return
+
+            with st.spinner(f"Generating {n_images} image(s) with {engine}…"):
+                try:
+                    img_bytes_list = _generate_images_for_engine(engine, prompt, n_images)
+                except Exception as e:  # noqa: BLE001
+                    st.error(str(e))
+                    return
+
+                saved_paths = []
+                for img_bytes in img_bytes_list:
+                    path = _save_image_bytes(slug, img_bytes, generated=True)
+                    saved_paths.append(path)
+
+            st.success(f"Saved {len(saved_paths)} image(s) to this campaign.")
+            st.rerun()
+
+def _render_variant_generation_ui(slug: str) -> None:
+    st.markdown("### 🪄 Generate Variants From a Base Image")
+
+    with st.expander("Open variant generator", expanded=False):
+        # Use pinned images as candidate bases
+        all_images = _list_all_images(slug)
+        meta = _load_image_metadata(slug)
+        pinned_images = [p for p in all_images if meta.get(p.name, {}).get("pinned")]
+
+        base_image_path: Path | None = None
+
+        if pinned_images:
+            st.write("Pinned images (choose one as the base):")
+
+            # Show thumbnails of pinned images
+            cols = st.columns(min(len(pinned_images), 4))
+            for idx, p in enumerate(pinned_images):
+                with cols[idx % len(cols)]:
+                    st.image(str(p), caption=p.name, use_container_width=True)
+
+            selected_name = st.radio(
+                "Base image",
+                options=[p.name for p in pinned_images],
+                index=0,
+            )
+            for p in pinned_images:
+                if p.name == selected_name:
+                    base_image_path = p
+                    break
+
+        else:
+            st.info(
+                "To use a base image, first upload images (above) or generate them, "
+                "then pin one in the gallery below. Pinned images will appear here as choices."
+            )
+
+        instructions = st.text_area(
+            "How should we improve this image?",
+            placeholder="e.g., Improve lighting, modernize the color palette, keep composition and main subject.",
+            height=100,
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Engine**")
+            st.write("OpenAI (Image Edit – preserves original)")  # label only
+            engine = "openai"
+
+        with col2:
+            n_variants = st.slider(
+                "Number of variants",
+                min_value=1,
+                max_value=6,
+                value=2,
+            )
+
+        if st.button("Generate improved variants", type="primary"):
+            if not base_image_path:
+                st.warning(
+                    "No base image selected. Pin an image in the gallery and then choose it here."
+                )
+                return
+            if not instructions.strip():
+                st.warning("Please describe how to improve the image.")
+                return
+
+            with st.spinner(f"Generating {n_variants} improved image(s) with OpenAI…"):
+                try:
+                    img_bytes_list = _generate_variants_for_engine(
+                        engine,
+                        base_image_path,
+                        instructions.strip(),
+                        n_variants,
+                    )
+                except Exception as e:
+                    st.error(str(e))
+                    return
+
+                saved_paths = []
+                for img_bytes in img_bytes_list:
+                    path = _save_image_bytes(slug, img_bytes, generated=True)
+                    saved_paths.append(path)
+
+            st.success(f"Saved {len(saved_paths)} improved variant(s).")
+            st.rerun()
+
+
+
+def _render_export_section(slug: str) -> None:
+    st.markdown("### 📦 Export Campaign Images")
+
+    images = _list_all_images(slug)
+    if not images:
+        st.info("No images to export yet. Generate or upload images first.")
+        return
+
+    st.write(f"This campaign currently has **{len(images)}** image(s).")
+
+    # Build the zip lazily when user clicks
+    if st.button("Prepare ZIP file"):
+        with st.spinner("Building ZIP of campaign images…"):
+            zip_bytes = _build_images_zip(slug)
+
+        if not zip_bytes:
+            st.warning("No images were found to export.")
+            return
+
+        st.success("ZIP file ready. Click below to download:")
+        st.download_button(
+            label="⬇️ Download campaign_images.zip",
+            data=zip_bytes,
+            file_name=f"{slug}_images.zip",
+            mime="application/zip",
+        )
+
+def _render_gallery(slug: str) -> None:
+    st.markdown("### 🖼️ Campaign Image Library")
+
+    images = _list_all_images(slug)
+    if not images:
+        st.info("No images yet. Generate or upload images first.")
+        return
+
+    # Load metadata (pinned / favorite)
+    meta = _load_image_metadata(slug)
+
+    # ---------- Fullscreen preview ----------
+    preview_key = f"{slug}_fullscreen_image"
+    preview_path = st.session_state.get(preview_key)
+
+    if preview_path:
+        st.markdown("#### 🔍 Preview")
+        st.image(preview_path, use_container_width=True)
+        if st.button("❌ Close preview"):
+            st.session_state[preview_key] = None
+            st.rerun()
+
+        st.markdown("---")
+
+    # ---------- Sort images: pinned, favorites, newest ----------
+    def sort_key(p: Path):
+        info = meta.get(p.name, {})
+        pinned = bool(info.get("pinned", False))
+        favorite = bool(info.get("favorite", False))
+        return (
+            0 if pinned else 1,
+            0 if favorite else 1,
+            -p.stat().st_mtime,
+        )
+
+    images_sorted = sorted(images, key=sort_key)
+
+    changed = False
+
+    # Wider cards so buttons don't wrap
+    cols = st.columns(2)
+
+    for idx, img_path in enumerate(images_sorted):
+        col = cols[idx % len(cols)]
+        with col:
+            info = meta.get(img_path.name, {})
+            pinned = bool(info.get("pinned", False))
+            favorite = bool(info.get("favorite", False))
+
+            # Caption badges
+            badge = ""
+            if pinned and favorite:
+                badge = "📌⭐"
+            elif pinned:
+                badge = "📌"
+            elif favorite:
+                badge = "⭐"
+
+            caption = img_path.name
+            if badge:
+                caption = f"{badge} {caption}"
+
+            st.image(str(img_path), caption=caption, use_container_width=True)
+
+            # Row 1: View + Delete
+            row1_col1, row1_col2 = st.columns(2)
+            with row1_col1:
+                if st.button("Preview", key=f"view_{slug}_{idx}"):
+                    st.session_state[preview_key] = str(img_path)
+                    st.rerun()
+
+            with row1_col2:
+                if st.button("🗑️", help="Delete image", key=f"del_{slug}_{idx}"):
+                    try:
+                        img_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    meta.pop(img_path.name, None)
+                    changed = True
+
+            # Row 2: Pin + Favorite
+            row2_col1, row2_col2 = st.columns(2)
+            with row2_col1:
+                pin_label = "Pin" if not pinned else "Unpin"
+                if st.button(pin_label, help="Pin / unpin image", key=f"pin_{slug}_{idx}"):
+                    info = meta.get(img_path.name, {})
+                    info["pinned"] = not pinned
+                    meta[img_path.name] = info
+                    changed = True
+
+            with row2_col2:
+                fav_label = "⭐" if not favorite else "⭐ Unfav"
+                if st.button(fav_label, help="Mark / unmark favorite", key=f"fav_{slug}_{idx}"):
+                    info = meta.get(img_path.name, {})
+                    info["favorite"] = not favorite
+                    meta[img_path.name] = info
+                    changed = True
+
+    if changed:
+        _save_image_metadata(slug, meta)
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> None:
     st.title("Image Library")
 
     slug = _get_current_slug()
     if not slug:
-        st.info("Select or create a campaign in the Dashboard first.")
+        st.warning("No campaign selected. Please choose a campaign on the Dashboard first.")
         return
 
-    campaign = load_campaign(slug)
-    campaign_name = getattr(campaign, "name", slug)
-    st.caption(f"Active campaign: **{campaign_name}**  (slug: `{slug}`)")
+    _render_campaign_header(slug)
 
-    _ensure_dirs(slug)
+    # Compact tools bar (one line) at the top
+    st.divider()
+    _render_tools_panel(slug)
 
-    # ----------------------------------------------------------------------
-    # Load images + metadata
-    # ----------------------------------------------------------------------
-    images_with_meta = _list_images_with_meta(slug)
-    meta = _load_meta(slug)
-    pinned_images = [img for img in images_with_meta if img["pinned"]]
-
-    # ----------------------------------------------------------------------
-    # Sidebar: pinned sidecar (multiple pins supported)
-    # ----------------------------------------------------------------------
-    with st.sidebar:
-        st.markdown("### Pinned images")
-
-        if pinned_images:
-            primary = pinned_images[0]
-            st.image(str(primary["path"]), use_container_width=True)
-            st.caption(f"Primary pinned: {primary['path'].name}")
-
-            if len(pinned_images) > 1:
-                st.markdown("Other pinned images:")
-                for extra in pinned_images[1:4]:
-                    st.image(str(extra["path"]), use_container_width=True)
-                    st.caption(extra["path"].name)
-        else:
-            st.caption("Pin one or more images below to feature them here.")
-
-    # ----------------------------------------------------------------------
-    # Generate / Edit images
-    # ----------------------------------------------------------------------
-    with st.expander("Generate new images", expanded=False):
-        default_prompt = (
-            getattr(campaign, "campaign_brief", "")
-            or getattr(campaign, "brief", "")
-            or ""
-        )
-
-        base_prompt = st.text_area(
-            "Prompt",
-            value=default_prompt,
-            help=(
-                "For edits, describe ONLY the change, e.g. "
-                "'put a construction worker standing in front of the bulldozer, "
-                "keep everything else the same.'"
-            ),
-            height=150,
-        )
-
-        engine_choice = st.selectbox(
-            "Image Engine",
-            options=["auto", "openai", "nanobanana", "stability"],
-            index=0,
-            help=(
-                "auto: try OpenAI first, then fall back to NanoBanana, then Stability.\n"
-                "openai: OpenAI only (supports exact edits when using the pinned image mode).\n"
-                "nanobanana: NanoBanana (Hugging Face) only.\n"
-                "stability: Stability SDXL only (great for photorealistic variants)."
-            ),
-        )
-
-        num_images = st.slider(
-            "Number of images",
-            min_value=1,
-            max_value=4,
-            value=1,
-            help="Generate up to 4 images in one batch.",
-        )
-
-        use_template = False
-        exact_edit_mode = False
-
-        if pinned_images:
-            use_template = st.checkbox(
-                "Use pinned images as style template / edit source",
-                value=False,
-                help=(
-                    "When enabled:\n"
-                    "• If engine is 'openai' or 'auto', CAF will edit the PRIMARY pinned image "
-                    "in-place using GPT Image (same image + your change).\n"
-                    "• If engine is 'nanobanana', CAF will generate new images in a similar style."
-                ),
-            )
-            if use_template:
-                st.info(
-                    "Pinned template active.\n\n"
-                    "• With OpenAI: true in-place edit of the primary pinned image.\n"
-                    "• With NanoBanana: new images in a similar style (no exact edits)."
-                )
-                if engine_choice in ("auto", "openai"):
-                    exact_edit_mode = True
-
-        # Effective prompt for non-edit style-mode
-        if use_template and pinned_images and not exact_edit_mode:
-            names = ", ".join(img["path"].name for img in pinned_images[:4])
-            effective_prompt = (
-                "Create new campaign images that closely match the overall style, "
-                "composition, color palette, and visual language of the pinned "
-                f"images ({names}). The new images should feel like they belong in "
-                "the same campaign system. Then apply the following instructions:\n\n"
-                f"{base_prompt}"
-            )
-        else:
-            effective_prompt = base_prompt
-
-        col_gen, col_status = st.columns([1, 2])
-        gen_clicked = col_gen.button("Generate", type="primary")
-
-        st.write("DEBUG → gen_clicked:", gen_clicked, "| num_images:", num_images)
-
-        if gen_clicked:
-            if not base_prompt.strip():
-                col_status.error("Please enter a prompt first.")
-            else:
-                try:
-                    with col_status:
-                        with st.spinner(
-                            f"Generating {num_images} image(s) using '{engine_choice}'..."
-                        ):
-                            successes = 0
-                            errors: List[str] = []
-
-                            for i in range(num_images):
-                                try:
-                                    if exact_edit_mode and pinned_images:
-                                        # TRUE EDIT: primary pinned image, gpt-image-1 edit
-                                        edit_prompt = (
-                                            "Edit this image while keeping everything else "
-                                            "as close as possible to the original. Apply ONLY "
-                                            "the following change(s):\n\n"
-                                            f"{base_prompt}"
-                                        )
-                                        template_path: Path = pinned_images[0]["path"]
-                                        image_bytes = _edit_image_with_openai(
-                                            template_path=template_path,
-                                            prompt=edit_prompt,
-                                            size="1024x1024",
-                                        )
-                                    else:
-                                        # Normal multi-engine generation (OpenAI / NanoBanana)
-                                        image_bytes, _engine_used = generate_image(
-                                            prompt=effective_prompt,
-                                            engine=engine_choice,
-                                            size="1024x1024",
-                                        )
-
-                                    ts = int(time.time() * 1000)
-                                    filename = f"{slug}_{ts}_{i}.png"
-                                    out_path = _generated_dir(slug) / filename
-                                    save_png(image_bytes, out_path)
-                                    successes += 1
-                                except Exception as e:
-                                    errors.append(str(e))
-
-                            if successes:
-                                if exact_edit_mode and pinned_images:
-                                    msg_extra = " (exact edit of primary pinned image)"
-                                elif use_template and pinned_images:
-                                    msg_extra = " (style-guided by pinned images)"
-                                else:
-                                    msg_extra = ""
-                                st.success(
-                                    f"Generated {successes} image(s){msg_extra}. "
-                                    "Scroll down to the Library to see them."
-                                )
-                            if errors:
-                                st.error("Some images failed:\n\n" + "\n".join(errors))
-                except Exception as e:
-                    col_status.error(f"Unexpected error in generate handler: {e}")
-                    st.exception(e)
-
-    # ----------------------------------------------------------------------
-    # Upload existing images
-    # ----------------------------------------------------------------------
-    with st.expander("Upload existing images", expanded=False):
-        upload_files = st.file_uploader(
-            "Upload PNG or JPG files",
-            type=["png", "jpg", "jpeg"],
-            accept_multiple_files=True,
-        )
-
-        if upload_files and st.button("Save uploads"):
-            status_box = st.empty()
-            saved_count = 0
-
-            for f in upload_files:
-                try:
-                    img = Image.open(f).convert("RGBA")
-                    ts = int(time.time() * 1000)
-                    filename = f"upload_{ts}_{f.name}.png"
-                    out_path = _uploads_dir(slug) / filename
-                    out_path.parent.mkdir(parents=True, exist_ok=True)
-                    img.save(out_path, format="PNG")
-                    saved_count += 1
-                except Exception as e:
-                    status_box.error(f"Failed to save {f.name}: {e}")
-
-            if saved_count:
-                status_box.success(
-                    f"Saved {saved_count} uploaded image(s). "
-                    "Scroll down to see them in the Library."
-                )
-
-    # ----------------------------------------------------------------------
-    # Library / gallery with pin/favorite/delete/Firefly
-    # ----------------------------------------------------------------------
-    st.subheader("Library")
-
-    images_with_meta = _list_images_with_meta(slug)
-    if not images_with_meta:
-        st.info("No images yet. Generate or upload some to get started.")
-        return
-
-    meta = _load_meta(slug)
-
-    for idx, item in enumerate(images_with_meta):
-        img_path: Path = item["path"]
-        section: str = item["section"]
-        pinned: bool = item["pinned"]
-        favorite: bool = item["favorite"]
-        filename = img_path.name
-
-        cols = st.columns([3, 2])
-
-        with cols[0]:
-            try:
-                st.image(str(img_path), use_container_width=True)
-            except Exception:
-                st.write(f"(Could not preview {img_path.name})")
-
-            badges = []
-            if pinned:
-                badges.append("📌 Pinned")
-            if favorite:
-                badges.append("⭐ Favorite")
-            badges.append(section.upper())
-            st.caption(" • ".join(badges))
-            st.code(str(img_path), language="bash")
-
-        with cols[1]:
-            st.markdown("**Actions**")
-
-            if st.button("📌 Pin" if not pinned else "Unpin", key=f"pin_{idx}"):
-                entry = meta.get(filename, {})
-                entry["pinned"] = not pinned
-                entry.setdefault("favorite", favorite)
-                meta[filename] = entry
-                _save_meta(slug, meta)
-                st.rerun()
-
-            if st.button(
-                "⭐ Favorite" if not favorite else "Remove favorite",
-                key=f"fav_{idx}",
-            ):
-                entry = meta.get(filename, {})
-                entry["favorite"] = not favorite
-                entry.setdefault("pinned", pinned)
-                meta[filename] = entry
-                _save_meta(slug, meta)
-                st.rerun()
-
-            firefly_url = make_firefly_edit_url(img_path)
-            st.markdown(
-                f"[Open in Adobe Firefly]({firefly_url})",
-                unsafe_allow_html=True,
-            )
-
-            if st.button("🗑️ Delete", key=f"del_{idx}"):
-                try:
-                    img_path.unlink(missing_ok=True)
-                except Exception as e:
-                    st.error(f"Failed to delete {img_path.name}: {e}")
-                if filename in meta:
-                    del meta[filename]
-                    _save_meta(slug, meta)
-                st.rerun()
-
-        st.markdown("---")
+    # Library visible without scrolling
+    st.divider()
+    _render_gallery(slug)
 
 
 if __name__ == "__main__":
