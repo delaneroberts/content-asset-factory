@@ -1,3 +1,5 @@
+# caf_app/campaign_generator.py
+
 from __future__ import annotations
 
 import json
@@ -5,16 +7,19 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from caf_app.utils import slugify, ensure_campaign_dir, ensure_subdir
 from caf_app.text_gen import generate_campaign_texts
-from caf_app.image_gen import (
-    generate_evo_hero_image,
-    generate_evo_support_image,
-    ImageProvider,
-)
 
+# NEW imports: multi-engine image generator
+from caf_app.image_gen import generate_image, save_png
+from caf_app.storage import campaigns_dir
+
+
+# ---------------------------------------------------------------------------
+# Result container (unchanged)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CampaignResult:
@@ -22,36 +27,115 @@ class CampaignResult:
     slug: str
     campaign_dir: Path
     hero_path: Path
-    supporting_paths: list[Path]
+    supporting_paths: List[Path]
     zip_path: Path
     text_assets: Dict[str, str]
     metadata: Dict[str, Any]
 
 
+# ---------------------------------------------------------------------------
+# Image directory helpers (MATCH the Image Library)
+# ---------------------------------------------------------------------------
+
+def _images_base_dir(slug: str) -> Path:
+    """Base images folder for a campaign."""
+    return campaigns_dir() / slug / "images"
+
+
+def _generated_dir(slug: str) -> Path:
+    """Generated images go here: campaigns/<slug>/images/generated"""
+    d = _images_base_dir(slug) / "generated"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Multi-engine image generation for hero + variants
+# ---------------------------------------------------------------------------
+
+def _generate_hero_image(
+    slug: str,
+    brief: str,
+    engine: str = "auto",
+    size: str = "1024x1024",
+) -> Path:
+    """Generate a hero image using the new multi-engine adapter."""
+
+    image_bytes, engine_used = generate_image(
+        prompt=brief,
+        engine=engine,
+        size=size,
+    )
+
+    out_dir = _generated_dir(slug)
+    filename = f"{slug}_hero.png"
+    out_path = out_dir / filename
+
+    save_png(image_bytes, out_path)
+
+    print(f"[CAF] Hero generated with engine: {engine_used}")
+
+    return out_path
+
+
+def _generate_support_images(
+    slug: str,
+    brief: str,
+    num_images: int = 3,
+    engine: str = "auto",
+    size: str = "1024x1024",
+) -> List[Path]:
+    """Generate supporting images using multi-engine adapter."""
+
+    out_dir = _generated_dir(slug)
+    results: List[Path] = []
+
+    for i in range(num_images):
+        image_bytes, engine_used = generate_image(
+            prompt=brief,
+            engine=engine,
+            size=size,
+        )
+
+        ts = int(datetime.utcnow().timestamp() * 1000)
+        filename = f"{slug}_support_{i}_{ts}.png"
+        out_path = out_dir / filename
+
+        save_png(image_bytes, out_path)
+        results.append(out_path)
+
+        print(f"[CAF] Support image {i+1} generated with engine: {engine_used}")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# MAIN: generate_campaign()
+# ---------------------------------------------------------------------------
+
 def generate_campaign(
     campaign_name: str,
     campaign_brief: str,
     base_output_dir: Path | None = None,
-    image_provider: ImageProvider = ImageProvider.OPENAI,
+    image_engine: str = "auto",       # << NEW: user can choose openai / nanobanana / auto
+    num_supporting: int = 3,          # << NEW: easy to configure
 ) -> Dict[str, Any]:
     """
     High-level orchestration for generating a campaign.
 
-    - Slugify campaign name
     - Create campaign directory under campaigns/<slug>/
-    - Generate text assets (tagline, slogans, etc.)
-    - Generate images (hero + supporting) via selected provider
-    - Write all copy to disk
-    - Save prompts used
-    - Save metadata JSON
-    - Create ZIP archive of campaign folder
-
-    Returns a dict suitable for the Streamlit UI.
+    - Generate text assets
+    - Generate hero + supporting images via multi-engine generator
+    - Save everything the UI needs
     """
 
     # ---------- Slug + folder ----------
     slug = slugify(campaign_name or "campaign")
     campaign_dir = ensure_campaign_dir(slug, base_output_dir)
+
+    # ---------- Prepare image folders ----------
+    images_dir = ensure_subdir(campaign_dir, "images")
+    # (Sub-directory 'generated' created automatically in generators)
 
     # ---------- Text generation ----------
     text_assets = generate_campaign_texts(
@@ -59,56 +143,30 @@ def generate_campaign(
         campaign_brief=campaign_brief,
     )
 
-    # ---------- Image generation ----------
-    # We generate into generated_images/ via image_gen.py,
-    # then copy into this campaign's images/ subfolder.
-
-    images_dir = ensure_subdir(campaign_dir, "images")
-
-    # Hero image
-    hero_tmp = generate_evo_hero_image(
-        campaign_brief,
-        filename=f"{slug}_hero.png",
+    # ---------- Image generation (NEW multi-engine) ----------
+    hero_path = _generate_hero_image(
+        slug=slug,
+        brief=campaign_brief,
+        engine=image_engine,
     )
-    hero_path: Path = images_dir / hero_tmp.name
-    shutil.copy(hero_tmp, hero_path)
 
-    # Supporting images (3 variants)
-    supporting_paths: list[Path] = []
-    for i in range(1, 4):
-        supp_tmp = generate_evo_support_image(
-            campaign_brief,
-            filename=f"{slug}_support_{i}.png",
-        )
-        supp_final = images_dir / supp_tmp.name
-        shutil.copy(supp_tmp, supp_final)
-        supporting_paths.append(supp_final)
+    supporting_paths = _generate_support_images(
+        slug=slug,
+        brief=campaign_brief,
+        num_images=num_supporting,
+        engine=image_engine,
+    )
 
     # ---------- Write copy files ----------
     copy_dir = ensure_subdir(campaign_dir, "copy")
 
-    (copy_dir / "tagline.txt").write_text(
-        text_assets["tagline"], encoding="utf-8"
-    )
-    (copy_dir / "slogans.txt").write_text(
-        text_assets["slogans"], encoding="utf-8"
-    )
-    (copy_dir / "value_prop.txt").write_text(
-        text_assets["value_prop"], encoding="utf-8"
-    )
-    (copy_dir / "ctas.txt").write_text(
-        text_assets["ctas"], encoding="utf-8"
-    )
-    (copy_dir / "social_posts.txt").write_text(
-        text_assets["social_posts"], encoding="utf-8"
-    )
-    (copy_dir / "campaign_summary.txt").write_text(
-        text_assets["summary"], encoding="utf-8"
-    )
-
-    # Prompts file (all prompts used for LLM)
-    prompts_path = copy_dir / "generation_prompts.txt"
-    prompts_path.write_text(text_assets["_prompts"], encoding="utf-8")
+    (copy_dir / "tagline.txt").write_text(text_assets["tagline"], encoding="utf-8")
+    (copy_dir / "slogans.txt").write_text(text_assets["slogans"], encoding="utf-8")
+    (copy_dir / "value_prop.txt").write_text(text_assets["value_prop"], encoding="utf-8")
+    (copy_dir / "ctas.txt").write_text(text_assets["ctas"], encoding="utf-8")
+    (copy_dir / "social_posts.txt").write_text(text_assets["social_posts"], encoding="utf-8")
+    (copy_dir / "campaign_summary.txt").write_text(text_assets["summary"], encoding="utf-8")
+    (copy_dir / "generation_prompts.txt").write_text(text_assets["_prompts"], encoding="utf-8")
 
     # ---------- Metadata ----------
     metadata: Dict[str, Any] = {
@@ -116,20 +174,15 @@ def generate_campaign(
         "slug": slug,
         "brief": campaign_brief,
         "created_at": datetime.utcnow().isoformat() + "Z",
-        "image_provider": image_provider.value if isinstance(image_provider, ImageProvider) else str(image_provider),
+        "image_engine": image_engine,                     # << NEW
         "images": {
             "hero": str(hero_path),
             "supporting": [str(p) for p in supporting_paths],
         },
-        "copy_files": {
-            "tagline": str(copy_dir / "tagline.txt"),
-            "slogans": str(copy_dir / "slogans.txt"),
-            "value_prop": str(copy_dir / "value_prop.txt"),
-            "ctas": str(copy_dir / "ctas.txt"),
-            "social_posts": str(copy_dir / "social_posts.txt"),
-            "summary": str(copy_dir / "campaign_summary.txt"),
-            "prompts": str(prompts_path),
-        },
+        "copy_files": {name: str(copy_dir / f"{name}.txt")
+                       for name in ["tagline", "slogans", "value_prop",
+                                     "ctas", "social_posts", "campaign_summary"]},
+        "prompts_file": str(copy_dir / "generation_prompts.txt"),
     }
 
     metadata_path = campaign_dir / "campaign_metadata.json"
@@ -148,7 +201,7 @@ def generate_campaign(
     )
 
     # ---------- Return structure for UI ----------
-    result: Dict[str, Any] = {
+    return {
         "campaign_name": campaign_name,
         "slug": slug,
         "campaign_dir": campaign_dir,
@@ -158,6 +211,3 @@ def generate_campaign(
         "text_assets": text_assets,
         "metadata": metadata,
     }
-
-    return result
-

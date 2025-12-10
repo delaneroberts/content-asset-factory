@@ -2,942 +2,448 @@
 from __future__ import annotations
 
 import base64
-import os
+import json
 import time
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
-import shutil
-import requests
 import streamlit as st
+from PIL import Image
 from openai import OpenAI, OpenAIError
-from PIL import Image  # for converting uploads to PNG
 
-from caf_app.models import Campaign, ImageAsset
-from caf_app.storage import (
-    load_campaign,
-    save_campaign,
-    ensure_campaign_image_folders,  # NEW
-)
+from caf_app.storage import campaigns_dir, load_campaign
+from caf_app.image_gen import generate_image, save_png, make_firefly_edit_url
 
 # OpenAI client (uses OPENAI_API_KEY from .env)
 client = OpenAI()
 
-# Hugging Face config (NanoBanana + SDXL)
-HF_API_KEY = os.getenv("HF_API_KEY")
-HF_NANOBANANA_MODEL_ID = os.getenv(
-    "HF_NANOBANANA_MODEL_ID", "REPLACE_WITH_NANOBANANA_MODEL_ID"
-)
-HF_SDXL_MODEL_ID = os.getenv(
-    "HF_SDXL_MODEL_ID",
-    "stabilityai/stable-diffusion-xl-base-1.0",
-)
 
-# Adobe Firefly config (OAuth server-to-server)
-FIREFLY_CLIENT_ID = os.getenv("FIREFLY_SERVICES_CLIENT_ID")
-FIREFLY_CLIENT_SECRET = os.getenv("FIREFLY_SERVICES_CLIENT_SECRET")
-
-# Simple token cache for Firefly (access tokens valid ~24h)
-_FIREFLY_ACCESS_TOKEN: str | None = None
-_FIREFLY_TOKEN_EXPIRES_AT: float = 0.0
-
-
-# ---- Helpers ---------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
 
 def _get_current_slug() -> str | None:
     return st.session_state.get("current_campaign_slug")
 
 
-def _project_root() -> Path:
-    # This file is at <root>/ui/pages/04_Image_Library.py
-    return Path(__file__).resolve().parents[2]
+def _campaign_dir(slug: str) -> Path:
+    return campaigns_dir() / slug
 
 
-def _campaign_images_dir(slug: str) -> Path:
-    """
-    New enterprise location for generated images:
-
-        campaigns/<slug>/images/generated/
-
-    This no longer writes into generated_images/<slug> directly.
-    """
-    images_base = ensure_campaign_image_folders(slug)  # campaigns/<slug>/images
-    directory = images_base / "generated"
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory
+def _images_base_dir(slug: str) -> Path:
+    return _campaign_dir(slug) / "images"
 
 
-def _import_uploaded_images(
-    campaign: Campaign,
-    uploaded_files: list,
-) -> List[ImageAsset]:
-    """
-    Save uploaded image files into this campaign's images directory
-    as PNGs and return them as ImageAsset objects.
+def _generated_dir(slug: str) -> Path:
+    return _images_base_dir(slug) / "generated"
 
-    - Stores under: campaigns/<slug>/images/generated/
-    - Filenames: <slug>_upload_<N>.png
-    - engine = "upload"
-    """
-    images_dir = _campaign_images_dir(campaign.slug)
-    images_dir.mkdir(parents=True, exist_ok=True)
 
-    existing_count = len(campaign.image_assets)
-    created: List[ImageAsset] = []
-    next_index = 1
+def _uploads_dir(slug: str) -> Path:
+    return _images_base_dir(slug) / "uploads"
 
-    for uploaded in uploaded_files:
-        suffix = Path(uploaded.name).suffix.lower()
-        if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
-            st.warning(f"Skipping {uploaded.name} (unsupported file type).")
+
+def _ensure_dirs(slug: str) -> None:
+    for p in (_generated_dir(slug), _uploads_dir(slug)):
+        p.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Pin / favorite metadata
+# ---------------------------------------------------------------------------
+
+def _meta_path(slug: str) -> Path:
+    return _images_base_dir(slug) / "images_meta.json"
+
+
+def _load_meta(slug: str) -> Dict[str, Dict[str, Any]]:
+    mp = _meta_path(slug)
+    if not mp.exists():
+        return {}
+    try:
+        with mp.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_meta(slug: str, meta: Dict[str, Dict[str, Any]]) -> None:
+    mp = _meta_path(slug)
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    with mp.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# List images + meta
+# ---------------------------------------------------------------------------
+
+def _list_images_with_meta(slug: str) -> List[Dict[str, Any]]:
+    meta = _load_meta(slug)
+    items: List[Dict[str, Any]] = []
+
+    sections = [
+        ("generated", _generated_dir),
+        ("uploads", _uploads_dir),
+    ]
+    exts = ("*.png", "*.jpg", "*.jpeg")
+
+    for section_name, dir_fn in sections:
+        d = dir_fn(slug)
+        if not d.exists():
             continue
+        for pattern in exts:
+            for p in sorted(d.glob(pattern)):
+                filename = p.name
+                entry_meta = meta.get(filename, {})
+                items.append(
+                    {
+                        "path": p,
+                        "section": section_name,
+                        "pinned": bool(entry_meta.get("pinned", False)),
+                        "favorite": bool(entry_meta.get("favorite", False)),
+                    }
+                )
 
-        try:
-            img = Image.open(uploaded)
-        except Exception as e:
-            st.warning(f"Could not open {uploaded.name}: {e}")
-            continue
-
-        filename = f"{campaign.slug}_upload_{existing_count + next_index}.png"
-        path = images_dir / filename
-
-        try:
-            img.save(path, format="PNG")
-        except Exception as e:
-            st.warning(f"Failed to save {uploaded.name} as PNG: {e}")
-            continue
-
-        rel_path = path.relative_to(_project_root())
-        created.append(
-            ImageAsset(
-                path=str(rel_path),
-                engine="upload",
-                prompt=f"Uploaded from {uploaded.name}",
-            )
+    # Sort: pinned → favorite → filename
+    items.sort(
+        key=lambda x: (
+            0 if x["pinned"] else 1,
+            0 if x["favorite"] else 1,
+            x["path"].name.lower(),
         )
-        next_index += 1
-
-    return created
-
-
-def _default_image_prompt(campaign: Campaign) -> str:
-    parts = []
-    if campaign.product_name:
-        parts.append(f"{campaign.product_name}")
-    if campaign.description:
-        parts.append(campaign.description)
-    if campaign.audience:
-        parts.append(f"For: {campaign.audience}")
-    if campaign.tone:
-        parts.append(f"Tone: {campaign.tone}")
-
-    base = " ".join(parts) or "A clean product hero shot on a simple background."
-
-    return (
-        f"{base}. Studio-quality product hero image, high detail, soft lighting, "
-        "clean background, no text or logos."
     )
+    return items
 
 
-# ---- Firefly auth helper ---------------------------------------------------
+# ---------------------------------------------------------------------------
+# OpenAI exact edit helper (gpt-image-1) — matches official Python example
+# ---------------------------------------------------------------------------
 
-
-def _get_firefly_access_token() -> str:
-    """
-    Get (and cache) an Adobe Firefly access token using client credentials.
-
-    Uses FIREFLY_SERVICES_CLIENT_ID / FIREFLY_SERVICES_CLIENT_SECRET from env.
-    """
-    global _FIREFLY_ACCESS_TOKEN, _FIREFLY_TOKEN_EXPIRES_AT
-
-    if _FIREFLY_ACCESS_TOKEN and time.time() < _FIREFLY_TOKEN_EXPIRES_AT - 300:
-        return _FIREFLY_ACCESS_TOKEN
-
-    if not FIREFLY_CLIENT_ID or not FIREFLY_CLIENT_SECRET:
-        raise RuntimeError(
-            "Adobe Firefly is not configured. "
-            "Set FIREFLY_SERVICES_CLIENT_ID and FIREFLY_SERVICES_CLIENT_SECRET "
-            "in your .env via Adobe Developer Console."
-        )
-
-    token_url = "https://ims-na1.adobelogin.com/ims/token/v3"
-    payload = {
-        "grant_type": "client_credentials",
-        "client_id": FIREFLY_CLIENT_ID,
-        "client_secret": FIREFLY_CLIENT_SECRET,
-        "scope": (
-            "openid,AdobeID,session,additional_info,read_organizations,"
-            "firefly_api,ff_apis"
-        ),
-    }
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
-    try:
-        resp = requests.post(token_url, headers=headers, data=payload, timeout=30)
-    except requests.RequestException as e:
-        raise RuntimeError(f"Firefly auth request failed: {e}") from e
-
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Firefly auth failed ({resp.status_code}): {resp.text[:500]}"
-        )
-
-    data = resp.json()
-    access_token = data.get("access_token")
-    if not access_token:
-        raise RuntimeError("Firefly auth response missing access_token.")
-
-    expires_in = data.get("expires_in", 24 * 3600)
-    _FIREFLY_ACCESS_TOKEN = access_token
-    _FIREFLY_TOKEN_EXPIRES_AT = time.time() + expires_in
-
-    return access_token
-
-
-# ---- Engine-specific generators -------------------------------------------
-
-
-def _generate_with_openai(
-    campaign: Campaign,
+def _edit_image_with_openai(
+    template_path: Path,
     prompt: str,
-    engine: str,
-    n_images: int,
-    size: str,
-) -> List[ImageAsset]:
+    size: str = "1024x1024",
+) -> bytes:
     """
-    Generate images using OpenAI's current image model (gpt-image-1).
+    True in-place edit using OpenAI's image edit API.
 
-    We keep the 'engine' parameter for UI labeling and metadata,
-    but under the hood everything goes through gpt-image-1.
+    This is what gives you: "same image, but now with a top hat / balloon / worker".
     """
-    images_dir = _campaign_images_dir(campaign.slug)
-
     try:
-        # This matches your working testme.py call
-        response = client.images.generate(
-            model="gpt-image-1",
-            prompt=prompt,
-            n=n_images,
-            size=size,
-            output_format="png",
-        )
-    except OpenAIError as e:
-        raise RuntimeError(f"OpenAI image generation failed: {e}") from e
-
-    # Decode the images and write them into the campaign's images dir
-    assets: List[ImageAsset] = []
-
-    if not getattr(response, "data", None):
-        raise RuntimeError(
-            "OpenAI did not return any image data. "
-            "This usually means your project does not have image model access, "
-            "or the request violated a safety / quota limit."
-        )
-
-    for idx, item in enumerate(response.data):
-        b64_data = getattr(item, "b64_json", None)
-        if not b64_data:
-            continue
-
-        image_bytes = base64.b64decode(b64_data)
-
-        filename = (
-            f"{campaign.slug}_{engine}_{len(campaign.image_assets) + idx + 1}.png"
-        )
-        path = images_dir / filename
-
-        with path.open("wb") as f:
-            f.write(image_bytes)
-
-        rel_path = path.relative_to(_project_root())
-
-        assets.append(
-            ImageAsset(
-                path=str(rel_path),
-                engine=engine,  # still records "dall-e-3" or "dall-e-2" for display
-                prompt=prompt,
-            )
-        )
-
-    if not assets:
-        raise RuntimeError(
-            "OpenAI returned a response but no usable image data. "
-            "Check logs and model access."
-        )
-
-    return assets
-
-
-def _generate_images_from_pinned(
-    campaign: Campaign,
-    pinned_path: Path,
-    prompt: str,
-    n_images: int,
-) -> List[ImageAsset]:
-    """
-    Use the pinned image as input to OpenAI's image edit API (gpt-image-1),
-    so the model actually "sees" the pinned image and applies the prompt
-    as an edit / variation.
-
-    For now we always use gpt-image-1 here, regardless of the UI engine label.
-    """
-    images_dir = _campaign_images_dir(campaign.slug)
-    images_dir.mkdir(parents=True, exist_ok=True)
-
-    # Call OpenAI image edit API with the pinned image as input
-    try:
-        with open(pinned_path, "rb") as f:
+        # Important: pass image as a LIST of file handles, like the docs
+        with template_path.open("rb") as f:
             result = client.images.edit(
                 model="gpt-image-1",
                 image=[f],
                 prompt=prompt,
-                n=n_images,
-                size="1024x1024",
-                output_format="png",
+                size=size,
+                n=1,
             )
+
+        b64 = result.data[0].b64_json
+        return base64.b64decode(b64)
+
     except OpenAIError as e:
         raise RuntimeError(f"OpenAI image edit failed: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error in image edit: {e}") from e
 
-    if not getattr(result, "data", None):
-        raise RuntimeError(
-            "OpenAI did not return any image data for the edit request."
-        )
 
-    assets: List[ImageAsset] = []
+# ---------------------------------------------------------------------------
+# Main Streamlit page
+# ---------------------------------------------------------------------------
 
-    for idx, item in enumerate(result.data):
-        b64_data = getattr(item, "b64_json", None)
-        if not b64_data:
-            continue
-
-        image_bytes = base64.b64decode(b64_data)
-
-        filename = (
-            f"{campaign.slug}_pinned_{len(campaign.image_assets) + idx + 1}.png"
-        )
-        path = images_dir / filename
-
-        with path.open("wb") as f_out:
-            f_out.write(image_bytes)
-
-        rel_path = path.relative_to(_project_root())
-
-        assets.append(
-            ImageAsset(
-                path=str(rel_path),
-                engine="pinned-template",  # label so you know it came from a template edit
-                prompt=prompt,
-            )
-        )
-
-    if not assets:
-        raise RuntimeError(
-            "OpenAI returned a response for the edit, but no usable image data."
-        )
-
-    return assets
-
-
-def _generate_with_nanobanana_hf(
-    campaign: Campaign,
-    prompt: str,
-    n_images: int,
-) -> List[ImageAsset]:
-    """
-    Generate images using a NanoBanana (or similar) model hosted on Hugging Face.
-
-    Uses:
-      HF_API_KEY                -> Hugging Face access token
-      HF_NANOBANANA_MODEL_ID    -> e.g. 'stabilityai/sdxl-turbo'
-    """
-    if not HF_API_KEY or not HF_NANOBANANA_MODEL_ID:
-        raise RuntimeError(
-            "NanoBanana (Hugging Face) is not configured. "
-            "Set HF_API_KEY and HF_NANOBANANA_MODEL_ID in your environment."
-        )
-
-    api_url = (
-        f"https://router.huggingface.co/hf-inference/models/{HF_NANOBANANA_MODEL_ID}"
-    )
-    headers = {
-        "Authorization": f"Bearer {HF_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "image/png",
-    }
-
-    images_dir = _campaign_images_dir(campaign.slug)
-    images_dir.mkdir(parents=True, exist_ok=True)
-
-    assets: List[ImageAsset] = []
-
-    for idx in range(n_images):
-        payload = {
-            "inputs": prompt,
-        }
-
-        try:
-            response = requests.post(
-                api_url,
-                headers=headers,
-                json=payload,
-                timeout=120,
-            )
-        except requests.RequestException as e:
-            raise RuntimeError(f"NanoBanana HF request failed: {e}") from e
-
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"NanoBanana HF generation failed ({response.status_code}): "
-                f"{response.text[:500]}"
-            )
-
-        # HF Inference API returns raw image bytes for image tasks
-        image_bytes = response.content
-
-        filename = (
-            f"{campaign.slug}_nanobanana_{len(campaign.image_assets) + idx + 1}.png"
-        )
-        path = images_dir / filename
-
-        with path.open("wb") as f:
-            f.write(image_bytes)
-
-        rel_path = path.relative_to(_project_root())
-
-        assets.append(
-            ImageAsset(
-                path=str(rel_path),
-                engine="nanobanana-hf",
-                prompt=prompt,
-            )
-        )
-
-    return assets
-
-
-def _generate_with_sdxl_hf(
-    campaign: Campaign,
-    prompt: str,
-    n_images: int,
-) -> List[ImageAsset]:
-    """
-    Generate images using Stable Diffusion XL hosted on Hugging Face.
-
-    Uses:
-      HF_API_KEY       -> Hugging Face access token
-      HF_SDXL_MODEL_ID -> e.g. 'stabilityai/stable-diffusion-xl-base-1.0'
-    """
-    if not HF_API_KEY or not HF_SDXL_MODEL_ID:
-        raise RuntimeError(
-            "Stable Diffusion XL (Hugging Face) is not configured. "
-            "Set HF_API_KEY and HF_SDXL_MODEL_ID in your environment."
-        )
-
-    api_url = f"https://router.huggingface.co/hf-inference/models/{HF_SDXL_MODEL_ID}"
-    headers = {
-        "Authorization": f"Bearer {HF_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "image/png",
-    }
-
-    images_dir = _campaign_images_dir(campaign.slug)
-    images_dir.mkdir(parents=True, exist_ok=True)
-
-    assets: List[ImageAsset] = []
-
-    for idx in range(n_images):
-        payload = {"inputs": prompt}
-
-        try:
-            response = requests.post(
-                api_url,
-                headers=headers,
-                json=payload,
-                timeout=120,
-            )
-        except requests.RequestException as e:
-            raise RuntimeError(f"SDXL HF request failed: {e}") from e
-
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"SDXL HF generation failed ({response.status_code}): "
-                f"{response.text[:500]}"
-            )
-
-        image_bytes = response.content
-
-        filename = (
-            f"{campaign.slug}_sdxl_{len(campaign.image_assets) + idx + 1}.png"
-        )
-        path = images_dir / filename
-
-        with path.open("wb") as f:
-            f.write(image_bytes)
-
-        rel_path = path.relative_to(_project_root())
-
-        assets.append(
-            ImageAsset(
-                path=str(rel_path),
-                engine="sdxl-hf",
-                prompt=prompt,
-            )
-        )
-
-    return assets
-
-
-def _generate_with_firefly(
-    campaign: Campaign,
-    prompt: str,
-    n_images: int,
-    size: str,
-) -> List[ImageAsset]:
-    """
-    Generate images using Adobe Firefly Text-to-Image API (v3 /images/generate).
-
-    We:
-      - Get an access token via IMS
-      - Call Firefly with numVariations, prompt, and size
-      - Download the returned image URLs and save them into the campaign folder.
-    """
-    token = _get_firefly_access_token()
-
-    # Parse size like "1024x1024" -> width/height ints
-    try:
-        width_str, height_str = size.split("x")
-        width = int(width_str)
-        height = int(height_str)
-    except Exception:
-        width = height = 1024
-
-    headers = {
-        "X-Api-Key": FIREFLY_CLIENT_ID,
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-    payload = {
-        "numVariations": n_images,
-        "prompt": prompt,
-        "size": {"width": width, "height": height},
-        "contentClass": "photo",  # could be "art" etc. later
-    }
-
-    try:
-        resp = requests.post(
-            "https://firefly-api.adobe.io/v3/images/generate",
-            headers=headers,
-            json=payload,
-            timeout=120,
-        )
-    except requests.RequestException as e:
-        raise RuntimeError(f"Firefly request failed: {e}") from e
-
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Firefly generation failed ({resp.status_code}): {resp.text[:500]}"
-        )
-
-    data = resp.json()
-    outputs = data.get("outputs") or []
-    if not outputs:
-        raise RuntimeError("Firefly returned no outputs for this request.")
-
-    images_dir = _campaign_images_dir(campaign.slug)
-    images_dir.mkdir(parents=True, exist_ok=True)
-
-    assets: List[ImageAsset] = []
-
-    # Each output has image.url; download them
-    for idx, out in enumerate(outputs[:n_images]):
-        img_info = out.get("image") or {}
-        url = img_info.get("url")
-        if not url:
-            continue
-
-        try:
-            img_resp = requests.get(url, timeout=120)
-        except requests.RequestException:
-            continue
-
-        if img_resp.status_code != 200:
-            continue
-
-        filename = f"{campaign.slug}_firefly_{len(campaign.image_assets) + idx + 1}.png"
-        path = images_dir / filename
-        with path.open("wb") as f:
-            f.write(img_resp.content)
-
-        rel_path = path.relative_to(_project_root())
-        assets.append(
-            ImageAsset(
-                path=str(rel_path),
-                engine="firefly",
-                prompt=prompt,
-            )
-        )
-
-    if not assets:
-        raise RuntimeError(
-            "Firefly returned outputs but no downloadable images. "
-            "Check Firefly permissions and response in logs."
-        )
-
-    return assets
-
-
-def _generate_image_files(
-    campaign: Campaign,
-    prompt: str,
-    engine: str,
-    n_images: int,
-    size: str = "1024x1024",
-) -> List[ImageAsset]:
-    """
-    Unified entry point: route to the appropriate backend based on engine.
-    engine:
-      - "dall-e-3"          -> OpenAI DALL·E 3
-      - "dall-e-2"          -> OpenAI DALL·E 2
-      - "nanobanana-hf"     -> NanoBanana on Hugging Face
-      - "sdxl-hf"           -> Stable Diffusion XL on Hugging Face
-      - "firefly"           -> Adobe Firefly
-    """
-
-    if engine in ("dall-e-3", "dall-e-2"):
-        return _generate_with_openai(
-            campaign=campaign,
-            prompt=prompt,
-            engine=engine,
-            n_images=n_images,
-            size=size,
-        )
-    elif engine == "nanobanana-hf":
-        return _generate_with_nanobanana_hf(
-            campaign=campaign,
-            prompt=prompt,
-            n_images=n_images,
-        )
-    elif engine == "sdxl-hf":
-        return _generate_with_sdxl_hf(
-            campaign=campaign,
-            prompt=prompt,
-            n_images=n_images,
-        )
-    elif engine == "firefly":
-        return _generate_with_firefly(
-            campaign=campaign,
-            prompt=prompt,
-            n_images=n_images,
-            size=size,
-        )
-    else:
-        raise RuntimeError(f"Unknown image engine: {engine}")
-
-
-# ---- Main UI ---------------------------------------------------------------
-
-
-def main() -> None:
+def main():
     st.title("Image Library")
 
     slug = _get_current_slug()
     if not slug:
-        st.warning(
-            "No campaign selected. Go to **Dashboard** first and create or open a campaign."
-        )
+        st.info("Select or create a campaign in the Dashboard first.")
         return
 
     campaign = load_campaign(slug)
-    if campaign is None:
-        st.error(
-            f"Could not load campaign with slug `{slug}`. "
-            "It may have been deleted or the file is corrupted."
-        )
-        return
+    campaign_name = getattr(campaign, "name", slug)
+    st.caption(f"Active campaign: **{campaign_name}**  (slug: `{slug}`)")
 
-    st.caption(f"Campaign: **{campaign.name}** (`{campaign.slug}`)")
+    _ensure_dirs(slug)
 
-    # --- Pinned image (sidebar) ---------------------------------------------
-    pinned_path = st.session_state.get("pinned_image")
-    if pinned_path:
-        pinned_file = Path(pinned_path)
-        if pinned_file.exists():
-            st.sidebar.subheader("Pinned image")
-            st.sidebar.image(str(pinned_file), use_container_width=True)
-            if st.sidebar.button("Unpin image"):
-                del st.session_state["pinned_image"]
-                st.rerun()
+    # ----------------------------------------------------------------------
+    # Load images + metadata
+    # ----------------------------------------------------------------------
+    images_with_meta = _list_images_with_meta(slug)
+    meta = _load_meta(slug)
+    pinned_images = [img for img in images_with_meta if img["pinned"]]
+
+    # ----------------------------------------------------------------------
+    # Sidebar: pinned sidecar (multiple pins supported)
+    # ----------------------------------------------------------------------
+    with st.sidebar:
+        st.markdown("### Pinned images")
+
+        if pinned_images:
+            primary = pinned_images[0]
+            st.image(str(primary["path"]), use_container_width=True)
+            st.caption(f"Primary pinned: {primary['path'].name}")
+
+            if len(pinned_images) > 1:
+                st.markdown("Other pinned images:")
+                for extra in pinned_images[1:4]:
+                    st.image(str(extra["path"]), use_container_width=True)
+                    st.caption(extra["path"].name)
         else:
-            # Clear stale pinned path
-            st.session_state.pop("pinned_image", None)
+            st.caption("Pin one or more images below to feature them here.")
 
-    # --- Generation controls -------------------------------------------------
-    with st.expander("➕ Generate new images", expanded=False):
+    # ----------------------------------------------------------------------
+    # Generate / Edit images
+    # ----------------------------------------------------------------------
+    with st.expander("Generate new images", expanded=False):
+        default_prompt = (
+            getattr(campaign, "campaign_brief", "")
+            or getattr(campaign, "brief", "")
+            or ""
+        )
 
-        st.markdown("### Generate new images")
+        base_prompt = st.text_area(
+            "Prompt",
+            value=default_prompt,
+            help=(
+                "For edits, describe ONLY the change, e.g. "
+                "'put a construction worker standing in front of the bulldozer, "
+                "keep everything else the same.'"
+            ),
+            height=150,
+        )
 
-        col1, col2, col3 = st.columns([3, 1, 1])
+        engine_choice = st.selectbox(
+            "Image Engine",
+            options=["auto", "openai", "nanobanana", "stability"],
+            index=0,
+            help=(
+                "auto: try OpenAI first, then fall back to NanoBanana, then Stability.\n"
+                "openai: OpenAI only (supports exact edits when using the pinned image mode).\n"
+                "nanobanana: NanoBanana (Hugging Face) only.\n"
+                "stability: Stability SDXL only (great for photorealistic variants)."
+            ),
+        )
 
-        with col1:
-            default_prompt = _default_image_prompt(campaign)
-            prompt = st.text_area(
-                "Image prompt",
-                value=default_prompt,
-                height=120,
+        num_images = st.slider(
+            "Number of images",
+            min_value=1,
+            max_value=4,
+            value=1,
+            help="Generate up to 4 images in one batch.",
+        )
+
+        use_template = False
+        exact_edit_mode = False
+
+        if pinned_images:
+            use_template = st.checkbox(
+                "Use pinned images as style template / edit source",
+                value=False,
+                help=(
+                    "When enabled:\n"
+                    "• If engine is 'openai' or 'auto', CAF will edit the PRIMARY pinned image "
+                    "in-place using GPT Image (same image + your change).\n"
+                    "• If engine is 'nanobanana', CAF will generate new images in a similar style."
+                ),
             )
-
-            # Optional: use pinned image as template
-            use_pinned_template = False
-            if pinned_path:
+            if use_template:
                 st.info(
-                    "A pinned image is available. You can use it as a base/template "
-                    "for the new images."
+                    "Pinned template active.\n\n"
+                    "• With OpenAI: true in-place edit of the primary pinned image.\n"
+                    "• With NanoBanana: new images in a similar style (no exact edits)."
                 )
-                use_pinned_template = st.checkbox(
-                    "Use pinned image as template",
-                    value=False,
-                    help=(
-                        "When enabled, new images will be derived from the pinned image "
-                        "instead of purely from the text prompt."
-                    ),
-                )
+                if engine_choice in ("auto", "openai"):
+                    exact_edit_mode = True
 
-        with col2:
-            engine = st.selectbox(
-                "Engine",
-                options=["dall-e-3", "dall-e-2", "nanobanana-hf", "sdxl-hf", "firefly"],
-                index=0,
-                format_func=lambda v: {
-                    "dall-e-3": "OpenAI – DALL·E 3",
-                    "dall-e-2": "OpenAI – DALL·E 2",
-                    "nanobanana-hf": "NanoBanana – Hugging Face",
-                    "sdxl-hf": "Stable Diffusion XL – Hugging Face",
-                    "firefly": "Adobe Firefly",
-                }[v],
-                help="Choose which backend to use for image generation.",
+        # Effective prompt for non-edit style-mode
+        if use_template and pinned_images and not exact_edit_mode:
+            names = ", ".join(img["path"].name for img in pinned_images[:4])
+            effective_prompt = (
+                "Create new campaign images that closely match the overall style, "
+                "composition, color palette, and visual language of the pinned "
+                f"images ({names}). The new images should feel like they belong in "
+                "the same campaign system. Then apply the following instructions:\n\n"
+                f"{base_prompt}"
             )
+        else:
+            effective_prompt = base_prompt
 
-            # Per-engine limits (matches your prior behavior, with SDXL same as NanoBanana)
-            if engine == "dall-e-3":
-                max_images = 2
-            elif engine == "dall-e-2":
-                max_images = 8
-            elif engine == "firefly":
-                max_images = 4
-            else:  # nanobanana-hf or sdxl-hf
-                max_images = 4  # conservative default
+        col_gen, col_status = st.columns([1, 2])
+        gen_clicked = col_gen.button("Generate", type="primary")
 
-            n_images = st.number_input(
-                "Count",
-                min_value=1,
-                max_value=max_images,
-                value=min(4, max_images),
-                step=1,
-            )
+        st.write("DEBUG → gen_clicked:", gen_clicked, "| num_images:", num_images)
 
-        with col3:
-            # Size options depend on engine
-            if engine == "dall-e-3":
-                size_options = ["1024x1024", "1024x1792", "1792x1024"]
-            elif engine == "dall-e-2":
-                size_options = ["1024x1024", "512x512"]
-            elif engine == "firefly":
-                # Firefly uses separate width/height fields, but we keep the same string format
-                size_options = ["1024x1024", "2048x2048"]
-            else:  # nanobanana-hf or sdxl-hf
-                size_options = ["1024x1024"]
-
-            size = st.selectbox(
-                "Size",
-                options=size_options,
-                index=0,
-            )
-
-        if st.button("Generate images", type="primary"):
-            if not prompt.strip():
-                st.warning("Please enter an image prompt.")
+        if gen_clicked:
+            if not base_prompt.strip():
+                col_status.error("Please enter a prompt first.")
             else:
                 try:
-                    with st.spinner("Generating images..."):
-                        # If user chose to use the pinned image as a template and one exists,
-                        # route through the pinned-image helper.
-                        if pinned_path and use_pinned_template:
-                            new_assets = _generate_images_from_pinned(
-                                campaign=campaign,
-                                pinned_path=Path(pinned_path),
-                                prompt=prompt.strip(),
-                                n_images=int(n_images),
-                            )
-                        else:
-                            new_assets = _generate_image_files(
-                                campaign=campaign,
-                                prompt=prompt.strip(),
-                                engine=engine,
-                                n_images=int(n_images),
-                                size=size,
-                            )
+                    with col_status:
+                        with st.spinner(
+                            f"Generating {num_images} image(s) using '{engine_choice}'..."
+                        ):
+                            successes = 0
+                            errors: List[str] = []
 
-                        campaign.image_assets.extend(new_assets)
-                        save_campaign(campaign)
+                            for i in range(num_images):
+                                try:
+                                    if exact_edit_mode and pinned_images:
+                                        # TRUE EDIT: primary pinned image, gpt-image-1 edit
+                                        edit_prompt = (
+                                            "Edit this image while keeping everything else "
+                                            "as close as possible to the original. Apply ONLY "
+                                            "the following change(s):\n\n"
+                                            f"{base_prompt}"
+                                        )
+                                        template_path: Path = pinned_images[0]["path"]
+                                        image_bytes = _edit_image_with_openai(
+                                            template_path=template_path,
+                                            prompt=edit_prompt,
+                                            size="1024x1024",
+                                        )
+                                    else:
+                                        # Normal multi-engine generation (OpenAI / NanoBanana)
+                                        image_bytes, _engine_used = generate_image(
+                                            prompt=effective_prompt,
+                                            engine=engine_choice,
+                                            size="1024x1024",
+                                        )
 
-                    st.success(f"Added {len(new_assets)} new images to this campaign.")
-                    st.rerun()
-                except RuntimeError as e:
-                    st.error(str(e))
+                                    ts = int(time.time() * 1000)
+                                    filename = f"{slug}_{ts}_{i}.png"
+                                    out_path = _generated_dir(slug) / filename
+                                    save_png(image_bytes, out_path)
+                                    successes += 1
+                                except Exception as e:
+                                    errors.append(str(e))
 
-    # --- Import existing images --------------------------------------------
-    st.markdown("### Import existing images")
+                            if successes:
+                                if exact_edit_mode and pinned_images:
+                                    msg_extra = " (exact edit of primary pinned image)"
+                                elif use_template and pinned_images:
+                                    msg_extra = " (style-guided by pinned images)"
+                                else:
+                                    msg_extra = ""
+                                st.success(
+                                    f"Generated {successes} image(s){msg_extra}. "
+                                    "Scroll down to the Library to see them."
+                                )
+                            if errors:
+                                st.error("Some images failed:\n\n" + "\n".join(errors))
+                except Exception as e:
+                    col_status.error(f"Unexpected error in generate handler: {e}")
+                    st.exception(e)
 
-    with st.expander("Upload images from your computer"):
-        uploaded_files = st.file_uploader(
-            "Select image files to import",
-            type=["png", "jpg", "jpeg", "webp"],
+    # ----------------------------------------------------------------------
+    # Upload existing images
+    # ----------------------------------------------------------------------
+    with st.expander("Upload existing images", expanded=False):
+        upload_files = st.file_uploader(
+            "Upload PNG or JPG files",
+            type=["png", "jpg", "jpeg"],
             accept_multiple_files=True,
         )
 
-        if uploaded_files and st.button(
-            "Add to image library",
-            type="secondary",
-        ):
-            with st.spinner("Importing images..."):
-                new_assets = _import_uploaded_images(campaign, uploaded_files)
+        if upload_files and st.button("Save uploads"):
+            status_box = st.empty()
+            saved_count = 0
 
-                if new_assets:
-                    campaign.image_assets.extend(new_assets)
-                    save_campaign(campaign)
-                    st.success(f"Imported {len(new_assets)} image(s) into this campaign.")
-                    st.rerun()
-                else:
-                    st.info("No images were imported. Check file types and try again.")
-
-    st.markdown("---")
-
-    # --- Existing images -----------------------------------------------------
-    st.markdown("### Existing images for this campaign")
-
-    if not campaign.image_assets:
-        st.write("No images generated yet. Use the controls above to generate some.")
-        return
-
-    show_only_favorites = st.checkbox("Show only favorites", value=False)
-
-    # 1) Clean up any assets whose files are missing on disk
-    all_assets: List[ImageAsset] = campaign.image_assets
-    valid_assets: List[ImageAsset] = []
-    missing_count = 0
-
-    for asset in all_assets:
-        img_path = _project_root() / asset.path
-        if img_path.exists():
-            valid_assets.append(asset)
-        else:
-            missing_count += 1
-
-    if missing_count:
-        campaign.image_assets = valid_assets
-        save_campaign(campaign)
-        st.info(f"Cleaned up {missing_count} image entries with missing files.")
-
-    assets = valid_assets
-
-    # 2) Apply "favorites only" filter
-    if show_only_favorites:
-        assets = [a for a in assets if a.is_favorite]
-
-    if not assets:
-        st.write("No images match this filter yet.")
-        return
-
-    cols = st.columns(3)
-
-    for idx, asset in enumerate(assets):
-        col = cols[idx % 3]
-        with col:
-            image_path = _project_root() / asset.path
-            st.image(str(image_path), use_container_width=True)
-
-            label = f"Engine: `{asset.engine}`"
-            if asset.engine == "upload":
-                label += " · Imported"
-            st.caption(label)
-
-            # Download + Edit in Firefly row (non-destructive)
-            dl_col, firefly_col = st.columns(2)
-
-            with dl_col:
+            for f in upload_files:
                 try:
-                    with open(image_path, "rb") as f:
-                        img_bytes = f.read()
-                    st.download_button(
-                        "Download",
-                        data=img_bytes,
-                        file_name=Path(asset.path).name,
-                        mime="image/png",
-                        key=f"dl_{asset.id}",
-                    )
-                except Exception:
-                    st.write("")
+                    img = Image.open(f).convert("RGBA")
+                    ts = int(time.time() * 1000)
+                    filename = f"upload_{ts}_{f.name}.png"
+                    out_path = _uploads_dir(slug) / filename
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    img.save(out_path, format="PNG")
+                    saved_count += 1
+                except Exception as e:
+                    status_box.error(f"Failed to save {f.name}: {e}")
 
-            with firefly_col:
-                # Simple link that opens Firefly in a new tab
-                st.markdown(
-                    '<a href="https://firefly.adobe.com" target="_blank">'
-                    'Edit in Firefly</a>',
-                    unsafe_allow_html=True,
+            if saved_count:
+                status_box.success(
+                    f"Saved {saved_count} uploaded image(s). "
+                    "Scroll down to see them in the Library."
                 )
 
-            # --- Favorite + Pin + Delete controls ---
-            col_fav, col_pin, col_del = st.columns([3, 2, 1])
+    # ----------------------------------------------------------------------
+    # Library / gallery with pin/favorite/delete/Firefly
+    # ----------------------------------------------------------------------
+    st.subheader("Library")
 
-            # Favorite / unfavorite
-            with col_fav:
-                fav_label = "★ Unfavorite" if asset.is_favorite else "☆ Favorite"
-                if st.button(fav_label, key=f"fav_img_{asset.id}"):
-                    asset.is_favorite = not asset.is_favorite
-                    save_campaign(campaign)
-                    st.rerun()
+    images_with_meta = _list_images_with_meta(slug)
+    if not images_with_meta:
+        st.info("No images yet. Generate or upload some to get started.")
+        return
 
-            # 📌 Pin image
-            with col_pin:
-                if st.button("📌 Pin", key=f"pin_img_{asset.id}"):
-                    st.session_state["pinned_image"] = str(image_path)
-                    st.success("Pinned this image for reuse.")
-                    st.rerun()
+    meta = _load_meta(slug)
 
-            # Delete image
-            with col_del:
-                if st.button("🗑", key=f"del_img_{asset.id}", help="Delete this image"):
-                    # Resolve full absolute path
-                    img_path = Path(asset.path)
-                    if not img_path.is_absolute():
-                        try:
-                            img_path = _project_root() / img_path
-                        except NameError:
-                            img_path = Path.cwd() / img_path
+    for idx, item in enumerate(images_with_meta):
+        img_path: Path = item["path"]
+        section: str = item["section"]
+        pinned: bool = item["pinned"]
+        favorite: bool = item["favorite"]
+        filename = img_path.name
 
-                    # Ensure the file is not held open (important for Pillow/macOS)
-                    try:
-                        img = Image.open(img_path)
-                        img.close()
-                    except Exception:
-                        # If it can't be opened, that's fine — still attempt delete
-                        pass
+        cols = st.columns([3, 2])
 
-                    # Delete the file
-                    try:
-                        img_path.unlink(missing_ok=True)
-                    except Exception as e:
-                        st.error(f"Failed to delete file: {e}")
-                    else:
-                        # Remove from campaign list and save
-                        campaign.image_assets = [
-                            a for a in campaign.image_assets if a.id != asset.id
-                        ]
-                        save_campaign(campaign)
-                        st.rerun()
+        with cols[0]:
+            try:
+                st.image(str(img_path), use_container_width=True)
+            except Exception:
+                st.write(f"(Could not preview {img_path.name})")
+
+            badges = []
+            if pinned:
+                badges.append("📌 Pinned")
+            if favorite:
+                badges.append("⭐ Favorite")
+            badges.append(section.upper())
+            st.caption(" • ".join(badges))
+            st.code(str(img_path), language="bash")
+
+        with cols[1]:
+            st.markdown("**Actions**")
+
+            if st.button("📌 Pin" if not pinned else "Unpin", key=f"pin_{idx}"):
+                entry = meta.get(filename, {})
+                entry["pinned"] = not pinned
+                entry.setdefault("favorite", favorite)
+                meta[filename] = entry
+                _save_meta(slug, meta)
+                st.rerun()
+
+            if st.button(
+                "⭐ Favorite" if not favorite else "Remove favorite",
+                key=f"fav_{idx}",
+            ):
+                entry = meta.get(filename, {})
+                entry["favorite"] = not favorite
+                entry.setdefault("pinned", pinned)
+                meta[filename] = entry
+                _save_meta(slug, meta)
+                st.rerun()
+
+            firefly_url = make_firefly_edit_url(img_path)
+            st.markdown(
+                f"[Open in Adobe Firefly]({firefly_url})",
+                unsafe_allow_html=True,
+            )
+
+            if st.button("🗑️ Delete", key=f"del_{idx}"):
+                try:
+                    img_path.unlink(missing_ok=True)
+                except Exception as e:
+                    st.error(f"Failed to delete {img_path.name}: {e}")
+                if filename in meta:
+                    del meta[filename]
+                    _save_meta(slug, meta)
+                st.rerun()
+
+        st.markdown("---")
 
 
 if __name__ == "__main__":

@@ -1,113 +1,167 @@
-# ui/01_Dashboard.py
+# ui/pages/01_Dashboard.py
 from __future__ import annotations
+
+from pathlib import Path
+from typing import List
 
 import streamlit as st
 
-from caf_app.storage import create_campaign, list_campaigns, delete_campaign
+from caf_app.campaign_generator import generate_campaign
+from caf_app.storage import campaigns_dir, load_campaign
 
 
-def _init_session_state() -> None:
-    if "current_campaign_slug" not in st.session_state:
-        st.session_state.current_campaign_slug = None
-    if "confirm_delete_slug" not in st.session_state:
-        st.session_state.confirm_delete_slug = None
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _list_campaign_slugs() -> List[str]:
+    """
+    Return a list of campaign slugs based on folders under campaigns/.
+    """
+    root = campaigns_dir()
+    if not root.exists():
+        return []
+    return sorted(
+        [p.name for p in root.iterdir() if p.is_dir()],
+        key=str.lower,
+    )
 
 
-def main() -> None:
-    _init_session_state()
+def _set_current_campaign(slug: str) -> None:
+    st.session_state["current_campaign_slug"] = slug
 
-    st.title("Campaign Dashboard")
 
-    st.markdown("### Create a new campaign")
+# ---------------------------------------------------------------------------
+# Main page
+# ---------------------------------------------------------------------------
 
-    with st.form("new_campaign_form", clear_on_submit=True):
-        name = st.text_input("Campaign name", placeholder="Spring Launch 2025")
-        submitted = st.form_submit_button("Create Campaign")
+def main():
+    st.title("Dashboard – Campaigns")
 
-    if submitted:
-        if not name.strip():
-            st.warning("Please enter a campaign name.")
-        else:
-            campaign = create_campaign(name.strip())
-            st.session_state.current_campaign_slug = campaign.slug
-            st.success(f"Created campaign **{campaign.name}** (slug: `{campaign.slug}`).")
-            st.info("Now switch to **Brief Editor** in the sidebar to define the brief.")
+    # Make sure campaigns root exists
+    campaigns_root = campaigns_dir()
+    campaigns_root.mkdir(parents=True, exist_ok=True)
 
-    st.markdown("---")
-    st.markdown("### Existing campaigns")
+    # Current selection from session
+    current_slug = st.session_state.get("current_campaign_slug")
 
-    campaigns = list_campaigns()
-    if not campaigns:
-        st.write("No campaigns yet. Create one above.")
-        return
+    # ----------------------------------------------------------------------
+    # Layout: left = create, right = existing
+    # ----------------------------------------------------------------------
+    col_left, col_right = st.columns([2, 1])
 
-    confirm_slug = st.session_state.get("confirm_delete_slug")
+    # ----------------------------------------------------------------------
+    # LEFT: Create / regenerate a campaign
+    # ----------------------------------------------------------------------
+    with col_left:
+        st.subheader("Create a new campaign")
 
-    for campaign in campaigns:
-        is_current = (
-            st.session_state.current_campaign_slug == campaign.slug
-        )
+        with st.form("create_campaign_form"):
+            campaign_name = st.text_input("Campaign name", value="")
+            campaign_brief = st.text_area(
+                "Campaign brief",
+                value="",
+                height=160,
+                help="Describe the product, audience, tone, and goals.",
+            )
 
-        # Added an extra column for the trash icon
-        cols = st.columns([4, 3, 3, 2, 1])
+            image_engine = st.selectbox(
+                "Image engine",
+                options=["auto", "openai", "nanobanana", "stability"],
+                index=0,
+                help=(
+                    "auto: try OpenAI → NanoBanana → Stability.\n"
+                    "openai: OpenAI only.\n"
+                    "nanobanana: NanoBanana only.\n"
+                    "stability: Stability SDXL only."
+                ),
+)
 
-        # --- Campaign name + slug ---
-        with cols[0]:
-            st.markdown(f"**{campaign.name}**")
-            slug_display = f"`{campaign.slug}`"
 
-            if is_current:
-                st.caption(slug_display + "  \n✅ *Current campaign*")
+            num_supporting = st.slider(
+                "Number of supporting images",
+                min_value=1,
+                max_value=6,
+                value=3,
+                help="How many supporting images to generate alongside the hero.",
+            )
+
+            submitted = st.form_submit_button("Generate campaign", type="primary")
+
+        if submitted:
+            if not campaign_name.strip():
+                st.error("Please enter a campaign name.")
+            elif not campaign_brief.strip():
+                st.error("Please enter a campaign brief.")
             else:
-                st.caption(slug_display)
+                with st.status("Generating campaign ...", expanded=True) as status:
+                    try:
+                        st.write("• Generating text assets...")
+                        result = generate_campaign(
+                            campaign_name=campaign_name,
+                            campaign_brief=campaign_brief,
+                            image_engine=image_engine,
+                            num_supporting=num_supporting,
+                        )
 
-        # --- Created timestamp ---
-        with cols[1]:
-            st.caption(f"Created: {campaign.created_at.strftime('%Y-%m-%d %H:%M')}")
+                        slug = result["slug"]
+                        _set_current_campaign(slug)
 
-        # --- Updated timestamp ---
-        with cols[2]:
-            st.caption(f"Updated: {campaign.updated_at.strftime('%Y-%m-%d %H:%M')}")
+                        st.write("• Text and images generated.")
+                        st.write(f"• Campaign folder: `{result['campaign_dir']}`")
+                        st.write(f"• ZIP export: `{result['zip_path']}`")
+                        status.update(label="Campaign generated successfully.", state="complete")
 
-        # --- Open / Selected button ---
-        with cols[3]:
-            button_label = "Selected" if is_current else "Open"
+                        st.success(
+                            f"✅ Campaign **{campaign_name}** created with slug `{slug}`.\n\n"
+                            "Use the sidebar to open the Brief, Text Library, and Image Library."
+                        )
+                    except Exception as e:
+                        status.update(label="Campaign generation failed.", state="error")
+                        st.error(f"Error while generating campaign: {e}")
+                        st.exception(e)
 
-            if st.button(button_label, key=f"open_{campaign.slug}"):
-                # Only switch if clicking on a NEW selection
-                if not is_current:
-                    st.session_state.current_campaign_slug = campaign.slug
-                    st.success(
-                        f"Selected **{campaign.name}**. "
-                        "Go to **Brief Editor** to view or edit its brief."
+    # ----------------------------------------------------------------------
+    # RIGHT: Existing campaigns
+    # ----------------------------------------------------------------------
+    with col_right:
+        st.subheader("Existing campaigns")
+
+        slugs = _list_campaign_slugs()
+        if not slugs:
+            st.info("No campaigns yet. Create one on the left.")
+        else:
+            # Try to default to current slug if present
+            if current_slug in slugs:
+                default_index = slugs.index(current_slug)
+            else:
+                default_index = 0
+
+            selected_slug = st.selectbox(
+                "Select campaign",
+                slugs,
+                index=default_index,
+                key="campaign_select_box",
+            )
+
+            if st.button("Load selected campaign"):
+                _set_current_campaign(selected_slug)
+                st.success(f"Loaded campaign `{selected_slug}`.")
+
+            # Show a tiny summary
+            try:
+                if selected_slug:
+                    campaign = load_campaign(selected_slug)
+                    name = getattr(campaign, "name", selected_slug)
+                    brief = getattr(campaign, "campaign_brief", "") or getattr(
+                        campaign, "brief", ""
                     )
-                    st.rerun()
-
-        # --- Delete (trashcan icon) ---
-        with cols[4]:
-            if st.button("🗑", key=f"del_{campaign.slug}", help="Delete this campaign"):
-                st.session_state.confirm_delete_slug = campaign.slug
-                st.rerun()
-
-    # --- Delete confirmation section ---
-    if confirm_slug:
-        st.warning(f"Are you sure you want to delete campaign `{confirm_slug}`?")
-        col_a, col_b = st.columns(2)
-
-        with col_a:
-            if st.button("Yes, delete permanently"):
-                delete_campaign(confirm_slug)
-                # Clear current selection if we just deleted it
-                if st.session_state.current_campaign_slug == confirm_slug:
-                    st.session_state.current_campaign_slug = None
-                st.session_state.confirm_delete_slug = None
-                st.success("Campaign deleted.")
-                st.rerun()
-
-        with col_b:
-            if st.button("Cancel"):
-                st.session_state.confirm_delete_slug = None
-                st.rerun()
+                    st.markdown("**Name:** " + name)
+                    if brief:
+                        st.markdown("**Brief (preview):**")
+                        st.caption(brief[:200] + ("..." if len(brief) > 200 else ""))
+            except Exception as e:
+                st.error(f"Failed to load campaign `{selected_slug}`: {e}")
 
 
 if __name__ == "__main__":

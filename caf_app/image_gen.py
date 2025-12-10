@@ -1,205 +1,293 @@
+# caf_app/image_gen.py
 from __future__ import annotations
 
 import base64
+import io
 import os
-from enum import Enum
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Tuple
 
-from PIL import Image, ImageDraw
+import requests
+from PIL import Image
+from openai import OpenAI, OpenAIError
 
-try:
-    # modern OpenAI SDK
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
+# ---------------------------------------------------------------------------
+# Config from environment
+# ---------------------------------------------------------------------------
 
-# Use the new storage helpers so images live under campaigns/<slug>/images/...
-from .storage import (
-    ensure_campaign_image_folders,
-    write_image_metadata_json,
-    embed_metadata_in_image,
+# OpenAI (gpt-image-1)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI()  # uses OPENAI_API_KEY from env
+
+# Hugging Face NanoBanana
+HF_API_KEY = os.getenv("HF_API_KEY")
+HF_NANOBANANA_MODEL_ID = os.getenv(
+    "HF_NANOBANANA_MODEL_ID", "REPLACE_WITH_NANOBANANA_MODEL_ID"
+)
+
+# Stability / SDXL
+STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
+STABILITY_ENGINE_ID = os.getenv(
+    "STABILITY_ENGINE_ID",
+    "stable-diffusion-xl-1024-v1-0",  # common SDXL engine id; override in .env if needed
 )
 
 
-class ImageProvider(str, Enum):
-    OPENAI = "openai"
-    PLACEHOLDER = "placeholder"
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-
-# ---------- Internal helpers ----------
-
-
-def _infer_slug_from_filename(filename: str) -> str:
+def _parse_size(size: str) -> Tuple[int, int]:
     """
-    Infer a campaign slug from a filename like 'evo-product-launch-1_hero.png'
-    -> 'evo-product-launch-1'.
-    If no underscore is present, uses the whole stem as slug.
+    Convert a size string like '1024x1024' into (width, height).
     """
-    stem = Path(filename).stem
-    parts = stem.split("_")
-    return parts[0] if parts else stem
-
-
-def _images_dir_for_slug(slug: str) -> Path:
-    """
-    Return the directory where generated images for this campaign should live:
-
-        campaigns/<slug>/images/generated/
-    """
-    base = ensure_campaign_image_folders(slug)  # campaigns/<slug>/images
-    d = base / "generated"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _write_basic_metadata(
-    slug: str,
-    variant_label: str,
-    brief: str,
-    out_path: Path,
-    engine_name: str,
-) -> None:
-    """
-    Write a JSON sidecar and (optionally) embed alt_text into the image.
-    This is best-effort; failures are logged but not raised.
-    """
-    metadata: Dict[str, Any] = {
-        "campaign": slug,
-        "variant": variant_label,
-        "engine": engine_name,
-        "brief": brief,
-        "alt_text": f"{variant_label} image for campaign '{slug}'",
-    }
     try:
-        write_image_metadata_json(out_path, metadata)
-        embed_metadata_in_image(out_path, metadata)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[image_gen] Warning: could not write metadata for {out_path}: {exc}")
+        w_str, h_str = size.lower().split("x")
+        return int(w_str), int(h_str)
+    except Exception:
+        # Fallback to 1024x1024 if something weird comes in
+        return 1024, 1024
 
 
-# ---------- Public API used by the app ----------
+# ---------------------------------------------------------------------------
+# OpenAI generator (gpt-image-1)
+# ---------------------------------------------------------------------------
 
-
-def generate_evo_hero_image(brief: str, filename: str) -> Path:
-    return _generate_evo_image(brief, "hero", filename)
-
-
-def generate_evo_support_image(brief: str, filename: str) -> Path:
-    return _generate_evo_image(brief, "support", filename)
-
-
-def generate_evo_logo_image(brief: str, filename: str) -> Path:
-    return _generate_evo_image(brief, "logo", filename)
-
-
-def _generate_evo_image(
-    brief: str,
-    variant_label: str,
-    filename: str,
-    provider: ImageProvider = ImageProvider.OPENAI,
-) -> Path:
+def _generate_openai_image(prompt: str, size: str) -> bytes:
     """
-    Main entrypoint: chooses provider, routes to OpenAI or placeholder.
+    Generate an image using OpenAI gpt-image-1.
 
-    NOTE: We keep the old signature (brief + filename) for compatibility,
-    but now infer the campaign slug from the filename and save into:
-
-        campaigns/<slug>/images/generated/<filename>
+    NOTE: New API does NOT accept 'response_format', so we omit it.
+    By default it returns base64 JSON (b64_json). If for some reason it
+    returns URLs instead, we fall back to fetching the URL.
     """
-    slug = _infer_slug_from_filename(filename)
-    images_dir = _images_dir_for_slug(slug)
-    out_path = images_dir / filename
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set in the environment.")
 
     try:
-        if provider == ImageProvider.OPENAI:
-            return _generate_openai_image(brief, variant_label, slug, out_path)
-        else:
-            return _generate_placeholder_image(variant_label, slug, out_path)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[image_gen] Error using provider {provider}: {exc}")
-        return _generate_placeholder_image(variant_label, slug, out_path)
+        result = openai_client.images.generate(
+            model="gpt-image-1",
+            prompt=prompt,
+            size=size,
+            n=1,
+        )
+    except OpenAIError as e:
+        raise RuntimeError(f"OpenAI image generation failed: {e}") from e
+
+    # Preferred: base64 field
+    try:
+        b64 = result.data[0].b64_json
+        return base64.b64decode(b64)
+    except Exception:
+        # Fallback: URL-based response
+        try:
+            url = result.data[0].url
+        except Exception:
+            raise RuntimeError("OpenAI image response missing 'b64_json' and 'url'.")
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        return resp.content
 
 
-# ---------- OpenAI provider (real API) ----------
+# ---------------------------------------------------------------------------
+# Hugging Face NanoBanana generator (via router.huggingface.co)
+# ---------------------------------------------------------------------------
 
-
-def _generate_openai_image(
-    brief: str,
-    variant_label: str,
-    slug: str,
-    out_path: Path,
-) -> Path:
+def _generate_nanobanana_image(prompt: str, size: str) -> bytes:
     """
-    Calls OpenAI gpt-image-1 and writes a PNG to out_path.
-    Requires OPENAI_API_KEY in the environment.
+    Generate an image using a NanoBanana model on Hugging Face Inference.
+
+    Uses the new router endpoint:
+      https://router.huggingface.co/hf-inference/models/{model_id}
     """
-    if OpenAI is None:
+    if not HF_API_KEY:
+        raise RuntimeError("HF_API_KEY is not set in the environment.")
+
+    if HF_NANOBANANA_MODEL_ID in ("", "REPLACE_WITH_NANOBANANA_MODEL_ID", None):
         raise RuntimeError(
-            "OpenAI SDK not installed. Run `pip install --upgrade openai`."
+            "HF_NANOBANANA_MODEL_ID is not configured. "
+            "Set it to your NanoBanana model ID from Hugging Face."
         )
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set in the environment")
+    width, height = _parse_size(size)
 
-    client = OpenAI(api_key=api_key)
+    # NEW REQUIRED ENDPOINT
+    url = f"https://router.huggingface.co/hf-inference/models/{HF_NANOBANANA_MODEL_ID}"
 
-    prompt = (
-        f"{brief.strip()}\n\n"
-        f"Image type: {variant_label} asset for a marketing campaign."
+    headers = {
+        "Authorization": f"Bearer {HF_API_KEY}",
+        "Accept": "image/png",
+    }
+
+    # Most image models on HF inference accept this minimal JSON structure.
+    payload = {
+        "inputs": prompt,
+        "options": {
+            "wait_for_model": True,
+        },
+        # Width/height are accepted by many SDXL fine-tunes; others may ignore.
+        "width": width,
+        "height": height,
+    }
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+
+    if resp.status_code != 200:
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"NanoBanana generation failed: {resp.status_code} {detail}")
+
+    # We requested Accept: image/png, so resp.content is raw PNG bytes
+    return resp.content
+
+
+# ---------------------------------------------------------------------------
+# Stability / SDXL generator
+# ---------------------------------------------------------------------------
+
+def _generate_stability_image(prompt: str, size: str) -> bytes:
+    """
+    Generate an image using Stability's text-to-image SDXL endpoint.
+    """
+    if not STABILITY_API_KEY:
+        raise RuntimeError("STABILITY_API_KEY is not set in the environment.")
+
+    width, height = _parse_size(size)
+
+    url = f"https://api.stability.ai/v1/generation/{STABILITY_ENGINE_ID}/text-to-image"
+
+    headers = {
+        "Authorization": f"Bearer {STABILITY_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    payload = {
+        "text_prompts": [{"text": prompt}],
+        "cfg_scale": 7,
+        "clip_guidance_preset": "NONE",
+        "height": height,
+        "width": width,
+        "samples": 1,
+        "steps": 30,
+    }
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+
+    if resp.status_code != 200:
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"Stability SDXL generation failed: {resp.status_code} {detail}")
+
+    data = resp.json()
+    artifacts = data.get("artifacts", [])
+    if not artifacts:
+        raise RuntimeError("Stability SDXL response contained no artifacts.")
+
+    b64 = artifacts[0].get("base64")
+    if not b64:
+        raise RuntimeError("Stability SDXL artifact missing 'base64' field.")
+
+    return base64.b64decode(b64)
+
+
+# ---------------------------------------------------------------------------
+# Public multi-engine adapter
+# ---------------------------------------------------------------------------
+
+def generate_image(
+    prompt: str,
+    engine: str = "auto",
+    size: str = "1024x1024",
+) -> tuple[bytes, str]:
+    """
+    Unified image generator used by CAF.
+
+    Returns (image_bytes, engine_used).
+
+    engine:
+      - "openai"       → gpt-image-1
+      - "nanobanana"   → HF NanoBanana
+      - "stability"/"sdxl" → Stability SDXL
+      - "auto"         → try OpenAI → NanoBanana → Stability
+    """
+    engine = (engine or "auto").lower().strip()
+
+    # Explicit engine selection
+    if engine == "openai":
+        return _generate_openai_image(prompt, size), "openai"
+
+    if engine == "nanobanana":
+        return _generate_nanobanana_image(prompt, size), "nanobanana"
+
+    if engine in ("stability", "sdxl"):
+        return _generate_stability_image(prompt, size), "stability"
+
+    # "auto" mode: cascade through providers
+    errors: list[str] = []
+
+    # 1) Try OpenAI
+    try:
+        img = _generate_openai_image(prompt, size)
+        return img, "openai"
+    except Exception as e:
+        errors.append(f"OpenAI: {e}")
+
+    # 2) Try NanoBanana
+    try:
+        img = _generate_nanobanana_image(prompt, size)
+        return img, "nanobanana"
+    except Exception as e:
+        errors.append(f"NanoBanana: {e}")
+
+    # 3) Try Stability / SDXL
+    try:
+        img = _generate_stability_image(prompt, size)
+        return img, "stability"
+    except Exception as e:
+        errors.append(f"Stability: {e}")
+
+    # If everything failed, surface a concise summary
+    raise RuntimeError(
+        "All image engines failed in auto mode:\n" + "\n".join(errors)
     )
 
-    print(f"[image_gen] Calling OpenAI for {variant_label} -> {out_path}")
 
-    result = client.images.generate(
-        model="gpt-image-1",
-        prompt=prompt,
-        n=1,
-        size="1024x1024",
-        quality="high",
-        output_format="png",
-    )
+# ---------------------------------------------------------------------------
+# Utility: save bytes to PNG on disk
+# ---------------------------------------------------------------------------
 
-    b64_data = result.data[0].b64_json
-    image_bytes = base64.b64decode(b64_data)
+def save_png(image_bytes: bytes, out_path: Path) -> None:
+    """
+    Save image bytes as a PNG file at out_path.
 
+    Handles both already-encoded PNGs and raw image bytes that Pillow can open.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "wb") as f:
-        f.write(image_bytes)
 
-    _write_basic_metadata(slug, variant_label, brief, out_path, "openai-gpt-image-1")
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img = img.convert("RGBA")
+            img.save(out_path, format="PNG")
+    except Exception:
+        # As a fallback, just write raw bytes (assume PNG)
+        with out_path.open("wb") as f:
+            f.write(image_bytes)
 
-    print(f"[image_gen] Saved OpenAI image to {out_path}")
-    return out_path
 
+# ---------------------------------------------------------------------------
+# Utility: Adobe Firefly handoff URL
+# ---------------------------------------------------------------------------
 
-# ---------- Placeholder fallback ----------
+def make_firefly_edit_url(image_path: Path) -> str:
+    """
+    Construct a Firefly URL for editing.
 
-
-def _generate_placeholder_image(
-    label: str,
-    slug: str,
-    out_path: Path,
-) -> Path:
-    img = Image.new("RGB", (1024, 1024), color=(180, 180, 180))
-    draw = ImageDraw.Draw(img)
-
-    text = label.upper()
-    x0, y0, x1, y1 = draw.textbbox((0, 0), text)
-    text_w = x1 - x0
-    text_h = y1 - y0
-
-    draw.text(
-        ((1024 - text_w) / 2, (1024 - text_h) / 2),
-        text,
-        fill=(0, 0, 0),
-    )
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(out_path)
-
-    _write_basic_metadata(slug, label, f"Placeholder {label} asset", out_path, "placeholder")
-
-    print(f"[image_gen] Saved placeholder image to {out_path}")
-    return out_path
+    Today this just opens Firefly's main page with a hint in the query;
+    Firefly does not support a direct local-file deep link without upload.
+    """
+    return f"https://firefly.adobe.com/?ref=content-asset-factory&image={image_path.name}"
