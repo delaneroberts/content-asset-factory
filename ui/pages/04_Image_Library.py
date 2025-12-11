@@ -20,6 +20,64 @@ from PIL import Image
 from caf_app.storage import load_campaign
 from caf_app.models import Campaign  # for type hints / future use
 
+# ---- Custom CSS for gallery improvements ----
+
+st.markdown("""
+<style>
+/* Add horizontal and vertical spacing between image cards */
+.image-card {
+    padding: 6px 12px 16px 12px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+/* Container around the image so we can position the badge */
+.image-wrapper {
+    position: relative;
+    display: inline-block;
+}
+
+/* Favorite badge (small yellow star in corner) */
+.favorite-badge {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    background: rgba(255, 221, 0, 0.85);
+    color: black;
+    font-size: 14px;
+    padding: 2px 6px;
+    border-radius: 6px;
+    font-weight: bold;
+    box-shadow: 0px 0px 4px rgba(0,0,0,0.4);
+}
+
+/* Action bar under each image */
+.image-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 6px;
+}
+
+/* Make icons look like clickable minimal buttons */
+.action-icon {
+    font-size: 20px;
+    cursor: pointer;
+    padding: 2px 6px;
+    user-select: none;
+}
+
+/* Yellow star when favorited */
+.favorite-active {
+    color: gold;
+}
+
+/* Dim star when not favorited */
+.favorite-inactive {
+    color: #888;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Config / clients
@@ -699,6 +757,7 @@ def _render_export_section(slug: str) -> None:
             file_name=f"{slug}_images.zip",
             mime="application/zip",
         )
+
 def _render_gallery(slug: str) -> None:
     st.markdown("### 🖼️ Campaign Image Library")
 
@@ -720,7 +779,50 @@ def _render_gallery(slug: str) -> None:
         st.info("No images match this filter yet.")
         return
 
-    # ---------- Sorting: selected first, then favorites, then newest ----------
+    # ---------- Preview + Info panels ----------
+    preview_key = f"{slug}_preview_image"
+    info_key = f"{slug}_info_image"
+
+    preview_path = st.session_state.get(preview_key)
+    info_name = st.session_state.get(info_key)
+
+    if preview_path:
+        st.markdown("#### 🔍 Preview")
+        st.image(preview_path, use_container_width=True)
+        if st.button("Close preview"):
+            st.session_state[preview_key] = None
+            st.rerun()
+        st.markdown("---")
+
+    if info_name and info_name in meta:
+        info = meta[info_name]
+        st.markdown("#### ℹ️ Image info")
+        st.write(f"**File:** `{info_name}`")
+
+        if "kind" in info:
+            st.write(f"**Kind:** {info['kind']}")
+        if "engine" in info:
+            st.write(f"**Engine:** {info['engine']}")
+        if "prompt" in info:
+            with st.expander("Prompt", expanded=False):
+                st.write(info["prompt"])
+        if "instructions" in info:
+            with st.expander("Instructions", expanded=False):
+                st.write(info["instructions"])
+        if "base_image" in info:
+            st.write(f"**Base image:** `{info['base_image']}`")
+        if "original_filename" in info:
+            st.write(f"**Original filename:** `{info['original_filename']}`")
+        if "created_at" in info:
+            st.write(f"**Created at:** {info['created_at']} (UTC)")
+
+        if st.button("Close info"):
+            st.session_state[info_key] = None
+            st.rerun()
+
+        st.markdown("---")
+
+    # ---------- Sorting: selected, favorites, then newest ----------
     def sort_key(p: Path):
         info = meta.get(p.name, {})
         selected = bool(info.get("selected"))
@@ -733,63 +835,7 @@ def _render_gallery(slug: str) -> None:
 
     images_sorted = sorted(images, key=sort_key)
 
-    # ---------- Determine currently selected images (for preview + variants) ----------
-    selected_paths = [p for p in images_sorted if meta.get(p.name, {}).get("selected")]
-
-    # ---------- Preview panel for FIRST selected image ----------
-    if selected_paths:
-        base = selected_paths[0]
-        info = meta.get(base.name, {})
-
-        st.markdown("#### Preview (first selected image)")
-        st.image(str(base), use_container_width=True)
-
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            fav_label = "Mark as favorite" if not info.get("favorite") else "Remove favorite"
-            if st.button(fav_label, key=f"preview_fav_{slug}"):
-                info["favorite"] = not info.get("favorite", False)
-                meta[base.name] = info
-                _save_image_metadata(slug, meta)
-                st.rerun()
-        with col_b:
-            if st.button("Clear this selection", key=f"preview_clear_{slug}"):
-                info["selected"] = False
-                meta[base.name] = info
-                _save_image_metadata(slug, meta)
-                st.rerun()
-        with col_c:
-            if st.button("Show details", key=f"preview_info_{slug}"):
-                # Just toggle a simple flag in session_state
-                st.session_state[f"{slug}_show_preview_info"] = not st.session_state.get(
-                    f"{slug}_show_preview_info", False
-                )
-
-        if st.session_state.get(f"{slug}_show_preview_info"):
-            st.markdown("##### Details")
-            st.write(f"**File:** `{base.name}`")
-            kind = info.get("kind")
-            engine = info.get("engine")
-            if kind:
-                st.write(f"**Kind:** {kind}")
-            if engine:
-                st.write(f"**Engine:** {engine}")
-            if "prompt" in info:
-                with st.expander("Prompt", expanded=False):
-                    st.write(info["prompt"])
-            if "instructions" in info:
-                with st.expander("Instructions", expanded=False):
-                    st.write(info["instructions"])
-            if "base_image" in info:
-                st.write(f"**Base image:** `{info['base_image']}`")
-            if "original_filename" in info:
-                st.write(f"**Original filename:** `{info['original_filename']}`")
-            if "created_at" in info:
-                st.write(f"**Created at:** {info['created_at']} (UTC)")
-
-        st.markdown("---")
-
-    # ---------- CSS for 200x200 thumbs ----------
+    # ---------- CSS for thumbs ----------
     st.markdown(
         """
         <style>
@@ -806,16 +852,22 @@ def _render_gallery(slug: str) -> None:
             height: 100%;
             object-fit: cover;
         }
+        .caf-link-row button {
+            border: none;
+            background: none;
+            padding: 0 4px;
+            margin: 0;
+            font-size: 0.9rem;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    # Track new checkbox states to sync back into metadata
     selection_states: dict[str, bool] = {}
     meta_changed = False
 
-    # ---------- 4-column grid: image + Select + filename ----------
+    # ---------- 4-column grid ----------
     cols = st.columns(4)
 
     for idx, img_path in enumerate(images_sorted):
@@ -825,6 +877,7 @@ def _render_gallery(slug: str) -> None:
             favorite = bool(info.get("favorite"))
             selected = bool(info.get("selected"))
 
+            # badges in filename caption
             badge = ""
             if favorite and selected:
                 badge = "⭐✔︎"
@@ -835,7 +888,16 @@ def _render_gallery(slug: str) -> None:
 
             caption = f"{badge} {img_path.name}" if badge else img_path.name
 
-            # Thumbnail (display only; no per-card buttons)
+            # ---------- Card wrapper (adds horizontal spacing) ----------
+            st.markdown('<div class="image-card">', unsafe_allow_html=True)
+
+            # ---------- Image with optional favorite badge ----------
+            st.markdown('<div class="image-wrapper">', unsafe_allow_html=True)
+
+            if favorite:
+                # little star badge in the corner
+                st.markdown('<div class="favorite-badge">⭐</div>', unsafe_allow_html=True)
+
             b64_bytes = base64.b64encode(img_path.read_bytes()).decode("utf-8")
             st.markdown(
                 f"""
@@ -846,6 +908,36 @@ def _render_gallery(slug: str) -> None:
                 unsafe_allow_html=True,
             )
 
+            st.markdown("</div>", unsafe_allow_html=True)  # close image-wrapper
+
+            # ---------- Icon controls row: 🔍 / ☆ or ⭐ / ℹ️ ----------
+            with st.container():
+                st.markdown('<div class="caf-link-row">', unsafe_allow_html=True)
+                lc1, lc2, lc3 = st.columns(3)
+
+                # 🔍 View / preview
+                with lc1:
+                    if st.button("🔍", key=f"view_{slug}_{idx}", help="Preview this image"):
+                        st.session_state[preview_key] = str(img_path)
+                        st.rerun()
+
+                # ☆ / ⭐ Favorite toggle (icon shows state)
+                with lc2:
+                    star_label = "⭐" if favorite else "☆"
+                    if st.button(star_label, key=f"fav_{slug}_{idx}", help="Toggle favorite"):
+                        info["favorite"] = not favorite
+                        meta[img_path.name] = info
+                        meta_changed = True
+
+                # ℹ️ Info
+                with lc3:
+                    if st.button("ℹ️", key=f"info_{slug}_{idx}", help="Show image details"):
+                        st.session_state[info_key] = img_path.name
+                        st.rerun()
+
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            # ---------- Select checkbox (for variants + bulk delete) ----------
             sel_key = f"sel_{slug}_{idx}"
             sel_value = st.checkbox(
                 "Select",
@@ -856,6 +948,8 @@ def _render_gallery(slug: str) -> None:
             selection_states[img_path.name] = sel_value
 
             st.caption(caption)
+
+            st.markdown("</div>", unsafe_allow_html=True)  # close image-card
 
     # ---------- Sync selection state back into metadata ----------
     for filename, is_selected in selection_states.items():
@@ -880,6 +974,7 @@ def _render_gallery(slug: str) -> None:
                     pass
                 meta.pop(name, None)
                 any_deleted = True
+
                 sel_key = f"sel_{slug}_{idx}"
                 if sel_key in st.session_state:
                     st.session_state[sel_key] = False
@@ -894,6 +989,7 @@ def _render_gallery(slug: str) -> None:
     if meta_changed:
         _save_image_metadata(slug, meta)
         st.rerun()
+
 
 # ---------------------------------------------------------------------------
 # Main
