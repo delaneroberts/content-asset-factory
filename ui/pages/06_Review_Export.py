@@ -148,6 +148,22 @@ def main() -> None:
         return
 
     campaign = load_campaign(slug)
+
+    # --- Normalize for SimpleNamespace-based campaigns -----------------
+    # Make sure attributes expected by this page exist.
+    if not hasattr(campaign, "concepts") or campaign.concepts is None:
+        campaign.concepts = []
+    if not hasattr(campaign, "image_assets") or campaign.image_assets is None:
+        campaign.image_assets = []
+    if not hasattr(campaign, "text_assets") or campaign.text_assets is None:
+        campaign.text_assets = []
+    if not hasattr(campaign, "copy_files") or campaign.copy_files is None:
+        campaign.copy_files = {}
+    if not hasattr(campaign, "images") or campaign.images is None:
+        campaign.images = {}
+    # -------------------------------------------------------------------
+
+    # In the new world, load_campaign never returns None, but keep this guard just in case
     if campaign is None:
         st.error(
             f"Could not load campaign with slug `{slug}`. "
@@ -155,8 +171,10 @@ def main() -> None:
         )
         return
 
-    st.caption(f"Campaign: **{campaign.name}** (`{campaign.slug}`)")
+    name = getattr(campaign, "name", slug)
+    st.caption(f"Campaign: **{name}** (`{campaign.slug}`)")
 
+    # No concepts yet
     if not campaign.concepts:
         st.info("You don't have any concepts yet. Build some in **Concept Builder** first.")
         return
@@ -166,7 +184,7 @@ def main() -> None:
     show_only_favorites = st.checkbox("Show only favorite concepts", value=False)
 
     concepts = (
-        [c for c in campaign.concepts if c.is_favorite]
+        [c for c in campaign.concepts if getattr(c, "is_favorite", False)]
         if show_only_favorites
         else campaign.concepts
     )
@@ -228,20 +246,25 @@ def main() -> None:
             # Text
             with cols[2]:
                 st.markdown("**Text**")
-                if concept.tagline:
+                if getattr(concept, "tagline", None):
                     st.markdown(f"**Tagline:** {concept.tagline}")
-                if concept.header:
+                if getattr(concept, "header", None):
                     st.markdown(f"**Header:** {concept.header}")
-                if concept.subheader:
+                if getattr(concept, "subheader", None):
                     st.markdown(f"**Subheader:** {concept.subheader}")
-                if concept.body:
+                if getattr(concept, "body", None):
                     st.markdown("**Body:**")
                     st.write(concept.body)
 
-                st.caption(
-                    f"Created: {concept.created_at.strftime('%Y-%m-%d %H:%M')} "
-                    f"{'(★ favorite)' if concept.is_favorite else ''}"
+                created_at = getattr(concept, "created_at", None)
+                created_str = (
+                    created_at.strftime("%Y-%m-%d %H:%M")
+                    if hasattr(created_at, "strftime")
+                    else str(created_at) if created_at is not None
+                    else "Unknown time"
                 )
+                fav_suffix = " (★ favorite)" if getattr(concept, "is_favorite", False) else ""
+                st.caption(f"Created: {created_str}{fav_suffix}")
 
     # Persist updated selection
     st.session_state.export_selected_concepts = selected_ids

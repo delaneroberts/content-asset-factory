@@ -7,6 +7,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from types import SimpleNamespace
 
 from .models import Campaign
 
@@ -175,46 +176,96 @@ def list_campaigns() -> List[Campaign]:
             continue
     return result
 
-
-def load_campaign(slug: str) -> Optional[Campaign]:
+def load_campaign(slug: str) -> SimpleNamespace:
     """
-    Load a single campaign by slug. Returns None if not found or corrupted.
+    Load a campaign by slug from the canonical structure:
+
+        campaigns/<slug>/campaign.json
+
+    If the file doesn't exist yet, fabricate a minimal campaign object so the
+    UI can still open and let the user fill things in.
     """
-    path = campaign_json_path(slug)
-    if not path.exists():
-        return None
-    try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        return _campaign_from_dict(data)
-    except json.JSONDecodeError as e:
-        print(f"[storage] Campaign JSON for slug '{slug}' is corrupted ({path}): {e}")
-        return None
-    except Exception as e:
-        print(f"[storage] Error loading campaign '{slug}' from {path}: {e}")
-        return None
+    root = campaigns_dir()
+    base_dir = root / slug
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    json_path = base_dir / "campaign.json"
+
+    if json_path.exists():
+        try:
+            with json_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            # If somehow it's corrupted, start fresh rather than crashing
+            data = {}
+    else:
+        data = {}
+
+    # ---- Minimal identity ----
+    data.setdefault("slug", slug)
+    data.setdefault("name", slug)
+
+    # ---- Common fields used in Brief Editor ----
+    data.setdefault("product_name", data.get("name"))
+    data.setdefault("description", "")
+    data.setdefault("audience", "")
+    data.setdefault("tone", "")
+    data.setdefault("notes", "")
+
+    # ---- Fields expected by Text Library / other pages ----
+    # Text Library expects a list of TextAsset-like objects
+    if "text_assets" not in data or data["text_assets"] is None:
+        data["text_assets"] = []
+
+    # Where text files live (if/when you wire them)
+    if "copy_files" not in data or data["copy_files"] is None:
+        data["copy_files"] = {}
+
+    # Image-related structures some pages expect; safe empty defaults
+    if "images" not in data or data["images"] is None:
+        data["images"] = {}
+
+    if "image_assets" not in data or data["image_assets"] is None:
+        data["image_assets"] = []
+
+    # Concept Builder / Review & Export expect a list of concepts
+    if "concepts" not in data or data["concepts"] is None:
+        data["concepts"] = []
+
+    return SimpleNamespace(**data)
 
 
-def save_campaign(campaign: Campaign) -> Campaign:
+def save_campaign(campaign: SimpleNamespace) -> None:
     """
-    Save a campaign to its JSON file and ensure its directory exists.
+    Save a campaign to:
+
+        campaigns/<slug>/campaign.json
+
+    Works with the SimpleNamespace returned by load_campaign and any object
+    with similar attributes.
     """
-    data = _campaign_to_dict(campaign)
-    slug = data.get("slug")
-    if not slug:
-        # Fallback: derive slug from name if missing
-        name = data.get("name") or data.get("title") or "campaign"
-        slug = slugify(str(name))
-        data["slug"] = slug
+    root = campaigns_dir()
 
-    # ensure folders
-    campaign_dir(slug)
-    path = campaign_json_path(slug)
-    with open(path, "w") as f:
-        # default=str handles datetime and other non-JSON types
-        json.dump(data, f, indent=2, default=str)
+    # Turn whatever we got into a plain dict
+    data = vars(campaign).copy()
 
-    return _campaign_from_dict(data)
+    slug = (
+        data.get("slug")
+        or data.get("name")
+        or data.get("product_name")
+        or "unnamed-campaign"
+    )
+    slug = str(slug)
+    data["slug"] = slug
+
+    base_dir = root / slug
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    json_path = base_dir / "campaign.json"
+
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
 
 
 def create_campaign(name: str, brief: str) -> Campaign:

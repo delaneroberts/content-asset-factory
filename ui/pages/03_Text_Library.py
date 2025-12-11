@@ -26,15 +26,15 @@ def _build_base_prompt(campaign: Campaign, kind: TextAssetKind, n_variants: int)
     }[kind]
 
     brief_parts = []
-    if campaign.product_name:
+    if getattr(campaign, "product_name", None):
         brief_parts.append(f"Product: {campaign.product_name}")
-    if campaign.description:
+    if getattr(campaign, "description", None):
         brief_parts.append(f"Description: {campaign.description}")
-    if campaign.audience:
+    if getattr(campaign, "audience", None):
         brief_parts.append(f"Target audience: {campaign.audience}")
-    if campaign.tone:
+    if getattr(campaign, "tone", None):
         brief_parts.append(f"Tone/style: {campaign.tone}")
-    if campaign.notes:
+    if getattr(campaign, "notes", None):
         brief_parts.append(f"Notes: {campaign.notes}")
 
     brief_text = "\n".join(brief_parts) or "No additional brief provided."
@@ -113,11 +113,20 @@ def _render_text_content(asset: TextAsset) -> None:
     """Render copy with a bit of visual hierarchy by kind."""
     txt = asset.content.strip()
     if asset.kind == "tagline":
-        st.markdown(f"<div style='font-size:1.1rem; font-weight:600;'>{txt}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='font-size:1.1rem; font-weight:600;'>{txt}</div>",
+            unsafe_allow_html=True,
+        )
     elif asset.kind == "header":
-        st.markdown(f"<div style='font-size:1.05rem; font-weight:600;'>{txt}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='font-size:1.05rem; font-weight:600;'>{txt}</div>",
+            unsafe_allow_html=True,
+        )
     else:
-        st.markdown(f"<div style='font-size:0.95rem; line-height:1.4;'>{txt}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='font-size:0.95rem; line-height:1.4;'>{txt}</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def main() -> None:
@@ -191,6 +200,19 @@ def main() -> None:
         return
 
     campaign = load_campaign(slug)
+
+    # --- Normalize for new SimpleNamespace-based campaigns -----------------
+    # Some campaigns may not yet have text_assets/image_assets fields.
+    if not hasattr(campaign, "text_assets") or campaign.text_assets is None:
+        campaign.text_assets = []
+    if not hasattr(campaign, "copy_files") or campaign.copy_files is None:
+        campaign.copy_files = {}
+    if not hasattr(campaign, "images") or campaign.images is None:
+        campaign.images = {}
+    if not hasattr(campaign, "image_assets") or campaign.image_assets is None:
+        campaign.image_assets = []
+    # ----------------------------------------------------------------------
+
     if campaign is None:
         st.error(
             f"Could not load campaign with slug `{slug}`. "
@@ -335,7 +357,6 @@ def main() -> None:
                             ]
                             save_campaign(campaign)
                             st.rerun()
-
 
                 st.markdown("</div>", unsafe_allow_html=True)  # close header
 
