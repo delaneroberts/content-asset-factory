@@ -809,7 +809,7 @@ def _render_gallery(slug: str) -> None:
         return (0 if favorite else 1, -p.stat().st_mtime)
 
     images_sorted = sorted(images, key=sort_key)
-
+    
     # ---------- CSS for centered image thumbnails ----------
     st.markdown("""
 <style>
@@ -854,72 +854,165 @@ def _render_gallery(slug: str) -> None:
 }
 </style>
 """, unsafe_allow_html=True)
-
+    
     selection_states = {}
     meta_changed = False
 
-    # ---------- 4-column responsive grid ----------
-    cols = st.columns(4)
+    # ---------- Main layout: gallery (left) + inspector (right) ----------
+    gallery_col, inspector_col = st.columns([5, 2], gap="large")
+#indentation conroversy
+    with gallery_col:
+        # ---------- 4-column responsive grid ----------
+        cols = st.columns(4)
 
-    for idx, img_path in enumerate(images_sorted):
-        col = cols[idx % 4]
-        with col:
-            info = meta.get(img_path.name, {})
-            favorite = bool(info.get("favorite"))
-            selected = bool(info.get("selected"))
+        for idx, img_path in enumerate(images_sorted):
+            col = cols[idx % 4]
+            with col:
+                info = meta.get(img_path.name, {})
+                favorite = bool(info.get("favorite"))
+                selected = bool(info.get("selected"))
 
-            badge = ""
-            if favorite and selected:
-                badge = "⭐✔︎"
-            elif favorite:
-                badge = "⭐"
-            elif selected:
-                badge = "✔︎"
+                badge = ""
+                if favorite and selected:
+                    badge = "⭐✔︎"
+                elif favorite:
+                    badge = "⭐"
+                elif selected:
+                    badge = "✔︎"
 
-            caption = f"{badge} {img_path.name}" if badge else img_path.name
+                caption = f"{badge} {img_path.name}" if badge else img_path.name
 
-            st.markdown('<div class="image-card">', unsafe_allow_html=True)
+                st.markdown('<div class="image-card">', unsafe_allow_html=True)
+                st.markdown('<div class="image-wrapper">', unsafe_allow_html=True)
 
-            # Image wrapper with star badge
-            st.markdown('<div class="image-wrapper">', unsafe_allow_html=True)
-            
-            # (Floating star removed completely)
+                b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
+                st.markdown(
+                    f'<div class="caf-thumb-box"><img src="data:image/png;base64,{b64}"></div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
 
-            b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
-            st.markdown(
-                f'<div class="caf-thumb-box"><img src="data:image/png;base64,{b64}"></div>',
-                unsafe_allow_html=True,
+                # ---------- Action Icons ----------
+                lc1, lc2, lc3 = st.columns(3)
+
+                with lc1:
+                    if st.button("🔍", key=f"view_{slug}_{img_path.name}"):
+                        st.session_state[preview_key] = str(img_path)
+                        st.rerun()
+
+                with lc2:
+                    star_label = "⭐" if favorite else "☆"
+                    if st.button(star_label, key=f"fav_{slug}_{img_path.name}"):
+                        info["favorite"] = not favorite
+                        meta[img_path.name] = info
+                        meta_changed = True
+
+                with lc3:
+                    if st.button("ℹ️", key=f"info_{slug}_{img_path.name}"):
+                        st.session_state["selected_image_name"] = img_path.name
+                        st.rerun()
+
+
+                # ---------- Select Checkbox ----------
+                sel_key = f"sel_{slug}_{img_path.name}"
+                sel_value = st.checkbox("Select", key=sel_key, value=selected)
+                selection_states[img_path.name] = sel_value
+
+                st.caption(caption)
+                st.markdown('</div>', unsafe_allow_html=True)
+                # END gallery_col
+                # (everything above is inside with gallery_col)
+
+#delane
+    with inspector_col:
+
+        st.subheader("Inspector")
+
+        selected_name = st.session_state.get("selected_image_name")
+
+        if not selected_name:
+            st.caption("Click ℹ️ on an image to view/edit metadata.")
+        else:
+            info = meta.get(selected_name, {})
+
+            # Find the selected image path by filename
+            selected_path = next((p for p in images_sorted if p.name == selected_name), None)
+
+            if selected_path and selected_path.exists():
+                st.image(str(selected_path), use_container_width=True)
+
+            st.markdown("### Provenance (read-only)")
+            st.text_input("Filename", value=selected_name, disabled=True, key=f"ins_fn_{slug}_{selected_name}")
+            st.text_input("Engine", value=str(info.get("engine", "")), disabled=True, key=f"ins_engine_{slug}_{selected_name}")
+            st.text_area("Prompt", value=str(info.get("prompt", "")), disabled=True, height=120, key=f"ins_prompt_{slug}_{selected_name}")
+
+            st.markdown("### Metadata (editable)")
+            title = st.text_input("Title", value=str(info.get("title", "")), key=f"ins_title_{slug}_{selected_name}")
+
+            type_options = ["hero", "lifestyle", "product_only", "background", "social", "supporting"]
+            current_type = info.get("asset_type", "supporting")
+            if current_type not in type_options:
+                current_type = "supporting"
+
+            asset_type = st.selectbox(
+                "Type",
+                type_options,
+                index=type_options.index(current_type),
+                key=f"ins_type_{slug}_{selected_name}",
             )
 
-            st.markdown('</div>', unsafe_allow_html=True)
+            channels = st.multiselect(
+                "Channels",
+                ["social", "web", "email", "print", "ads"],
+                default=info.get("channels", []),
+                key=f"ins_channels_{slug}_{selected_name}",
+            )
 
-            # ---------- Action Icons ----------
-            lc1, lc2, lc3 = st.columns(3)
+            approval_options = ["draft", "approved", "rejected"]
+            current_approval = info.get("approval_status", "draft")
+            if current_approval not in approval_options:
+                current_approval = "draft"
 
-            with lc1:
-                if st.button("🔍", key=f"view_{slug}_{img_path.name}"):
-                    st.session_state[preview_key] = str(img_path)
-                    st.rerun()
+            approval_status = st.selectbox(
+                "Approval status",
+                approval_options,
+                index=approval_options.index(current_approval),
+                key=f"ins_approval_{slug}_{selected_name}",
+            )
 
-            with lc2:
-                star_label = "⭐" if favorite else "☆"
-                if st.button(star_label, key=f"fav_{slug}_{img_path.name}"):
-                    info["favorite"] = not favorite
-                    meta[img_path.name] = info
+            rights_options = ["internal", "external", "paid_media", "unrestricted"]
+            current_rights = info.get("usage_rights", "internal")
+            if current_rights not in rights_options:
+                current_rights = "internal"
+
+            usage_rights = st.selectbox(
+                "Usage rights",
+                rights_options,
+                index=rights_options.index(current_rights),
+                key=f"ins_rights_{slug}_{selected_name}",
+            )
+
+            notes = st.text_area("Notes", value=str(info.get("notes", "")), height=120, key=f"ins_notes_{slug}_{selected_name}")
+
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                if st.button("Save", key=f"ins_save_{slug}_{selected_name}"):
+                    info = meta.get(selected_name, {})
+                    info["title"] = title
+                    info["asset_type"] = asset_type
+                    info["channels"] = channels
+                    info["approval_status"] = approval_status
+                    info["usage_rights"] = usage_rights
+                    info["notes"] = notes
+                    meta[selected_name] = info
                     meta_changed = True
+                    st.success("Saved.")
 
-            with lc3:
-                if st.button("ℹ️", key=f"info_{slug}_{img_path.name}"):
-                    st.session_state[info_key] = img_path.name
+            with c2:
+                if st.button("Close", key=f"ins_close_{slug}_{selected_name}"):
+                    st.session_state["selected_image_name"] = None
                     st.rerun()
 
-            # ---------- Select Checkbox ----------
-            sel_key = f"sel_{slug}_{img_path.name}"
-            sel_value = st.checkbox("Select", key=sel_key, value=selected)
-            selection_states[img_path.name] = sel_value
-
-            st.caption(caption)
-            st.markdown('</div>', unsafe_allow_html=True)
 
     # ---------- Sync selection metadata ----------
     for filename, selected in selection_states.items():
@@ -968,6 +1061,10 @@ def main() -> None:
     if not slug:
         st.warning("No campaign selected. Please choose a campaign on the Dashboard first.")
         return
+    
+    # Inspector state (right panel selection)
+    if "selected_image_name" not in st.session_state:
+        st.session_state["selected_image_name"] = None
 
     _render_campaign_header(slug)
 
