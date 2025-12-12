@@ -1,18 +1,19 @@
 # ui/pages/01_Dashboard.py
 from __future__ import annotations
 
-from pathlib import Path
 from typing import List
 
+import shutil
 import streamlit as st
 
-from caf_app.campaign_generator import generate_campaign
-from caf_app.storage import campaigns_dir, load_campaign
+import caf_app.campaign_generator as campaign_generator
+from caf_app.storage import campaigns_dir, load_campaign, save_campaign
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _list_campaign_slugs() -> List[str]:
     """
@@ -31,27 +32,53 @@ def _set_current_campaign(slug: str) -> None:
     st.session_state["current_campaign_slug"] = slug
 
 
+def _delete_campaign(slug: str) -> None:
+    """
+    Delete the entire campaign folder for the given slug.
+    """
+    root = campaigns_dir()
+    target = root / slug
+    if target.exists() and target.is_dir():
+        shutil.rmtree(target)
+
+
+def _rename_campaign(slug: str, new_name: str) -> None:
+    """
+    Rename a campaign by updating its stored name (NOT the slug/folder).
+    Safer: we keep the same slug and just change the human-readable name.
+    """
+    campaign = load_campaign(slug)
+    if campaign is None:
+        raise RuntimeError(f"Could not load campaign '{slug}' for rename.")
+
+    # Try common name attributes
+    if hasattr(campaign, "name"):
+        campaign.name = new_name
+    if hasattr(campaign, "campaign_name"):
+        setattr(campaign, "campaign_name", new_name)
+
+    save_campaign(campaign)
+
+
 # ---------------------------------------------------------------------------
 # Main page
 # ---------------------------------------------------------------------------
 
-def main():
+
+def main() -> None:
     st.title("Dashboard – Campaigns")
 
     # Make sure campaigns root exists
     campaigns_root = campaigns_dir()
     campaigns_root.mkdir(parents=True, exist_ok=True)
 
-    # Current selection from session
+    # Try to get currently selected campaign (if any)
     current_slug = st.session_state.get("current_campaign_slug")
 
-    # ----------------------------------------------------------------------
-    # Layout: left = create, right = existing
-    # ----------------------------------------------------------------------
     col_left, col_right = st.columns([2, 1])
 
     # ----------------------------------------------------------------------
-    # LEFT: Create / regenerate a campaign
+    # LEFT: Create / regenerate a campaign (TEXT ONLY)
     # ----------------------------------------------------------------------
     with col_left:
         st.subheader("Create a new campaign")
@@ -65,27 +92,6 @@ def main():
                 help="Describe the product, audience, tone, and goals.",
             )
 
-            image_engine = st.selectbox(
-                "Image engine",
-                options=["auto", "openai", "nanobanana", "stability"],
-                index=0,
-                help=(
-                    "auto: try OpenAI → NanoBanana → Stability.\n"
-                    "openai: OpenAI only.\n"
-                    "nanobanana: NanoBanana only.\n"
-                    "stability: Stability SDXL only."
-                ),
-)
-
-
-            num_supporting = st.slider(
-                "Number of supporting images",
-                min_value=1,
-                max_value=6,
-                value=3,
-                help="How many supporting images to generate alongside the hero.",
-            )
-
             submitted = st.form_submit_button("Generate campaign", type="primary")
 
         if submitted:
@@ -94,27 +100,29 @@ def main():
             elif not campaign_brief.strip():
                 st.error("Please enter a campaign brief.")
             else:
-                with st.status("Generating campaign ...", expanded=True) as status:
+                with st.status("Generating campaign (text only)...", expanded=True) as status:
                     try:
                         st.write("• Generating text assets...")
-                        result = generate_campaign(
+                        result = campaign_generator.generate_campaign(
                             campaign_name=campaign_name,
                             campaign_brief=campaign_brief,
-                            image_engine=image_engine,
-                            num_supporting=num_supporting,
                         )
 
                         slug = result["slug"]
                         _set_current_campaign(slug)
 
-                        st.write("• Text and images generated.")
+                        st.write("• Text assets generated.")
                         st.write(f"• Campaign folder: `{result['campaign_dir']}`")
                         st.write(f"• ZIP export: `{result['zip_path']}`")
-                        status.update(label="Campaign generated successfully.", state="complete")
+                        status.update(
+                            label="Campaign generated successfully (text only).",
+                            state="complete",
+                        )
 
                         st.success(
                             f"✅ Campaign **{campaign_name}** created with slug `{slug}`.\n\n"
-                            "Use the sidebar to open the Brief, Text Library, and Image Library."
+                            "Use the sidebar to open the Brief, Text Library, and Image Library "
+                            "to generate images later."
                         )
                     except Exception as e:
                         status.update(label="Campaign generation failed.", state="error")
@@ -122,7 +130,7 @@ def main():
                         st.exception(e)
 
     # ----------------------------------------------------------------------
-    # RIGHT: Existing campaigns
+    # RIGHT: Existing campaigns (select / open / rename / delete)
     # ----------------------------------------------------------------------
     with col_right:
         st.subheader("Existing campaigns")
@@ -138,30 +146,75 @@ def main():
                 default_index = 0
 
             selected_slug = st.selectbox(
-                "Select campaign",
-                slugs,
+                "Select a campaign",
+                options=slugs,
                 index=default_index,
-                key="campaign_select_box",
+                format_func=lambda s: s,
+                help="Choose an existing campaign to continue working on it.",
             )
 
-            if st.button("Load selected campaign"):
+            if st.button("Open campaign"):
                 _set_current_campaign(selected_slug)
-                st.success(f"Loaded campaign `{selected_slug}`.")
+                st.success(
+                    f"Opened campaign `{selected_slug}`. "
+                    "Use the sidebar to navigate to the Brief, Text Library, or Image Library."
+                )
 
-            # Show a tiny summary
+            # Show a small preview (name + brief snippet) for context
+            name = selected_slug
+            brief = ""
             try:
                 if selected_slug:
                     campaign = load_campaign(selected_slug)
-                    name = getattr(campaign, "name", selected_slug)
-                    brief = getattr(campaign, "campaign_brief", "") or getattr(
-                        campaign, "brief", ""
-                    )
-                    st.markdown("**Name:** " + name)
-                    if brief:
-                        st.markdown("**Brief (preview):**")
-                        st.caption(brief[:200] + ("..." if len(brief) > 200 else ""))
+                    if campaign is not None:
+                        name = getattr(campaign, "name", selected_slug)
+                        brief = getattr(campaign, "campaign_brief", "") or getattr(
+                            campaign, "brief", ""
+                        )
+
+                st.markdown("**Name:** " + name)
+                if brief:
+                    st.markdown("**Brief (preview):**")
+                    st.caption(brief[:200] + ("..." if len(brief) > 200 else ""))
             except Exception as e:
                 st.error(f"Failed to load campaign `{selected_slug}`: {e}")
+
+            st.markdown("---")
+            st.subheader("Manage campaign")
+
+            # Rename campaign (name only, slug stays the same)
+            new_name = st.text_input(
+                "Rename campaign (changes display name only)",
+                value=name,
+                key=f"rename_{selected_slug}",
+            )
+
+            col_rename, col_delete = st.columns(2)
+
+            with col_rename:
+                if st.button("Save new name", key=f"btn_rename_{selected_slug}"):
+                    if not new_name.strip():
+                        st.error("New name cannot be empty.")
+                    else:
+                        try:
+                            _rename_campaign(selected_slug, new_name.strip())
+                            st.success(f"Renamed campaign `{selected_slug}` to “{new_name.strip()}”.")
+                        except Exception as e:
+                            st.error(f"Failed to rename campaign `{selected_slug}`: {e}")
+                            st.exception(e)
+
+            with col_delete:
+                if st.button("Delete campaign", key=f"btn_delete_{selected_slug}"):
+                    try:
+                        _delete_campaign(selected_slug)
+                        if current_slug == selected_slug:
+                            st.session_state.pop("current_campaign_slug", None)
+                        st.success(f"Deleted campaign `{selected_slug}`.")
+                        # Force a rerun so the selectbox updates
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to delete campaign `{selected_slug}`: {e}")
+                        st.exception(e)
 
 
 if __name__ == "__main__":

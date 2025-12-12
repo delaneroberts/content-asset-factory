@@ -4,12 +4,36 @@ from __future__ import annotations
 import json
 import re
 import shutil
-from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 from types import SimpleNamespace
-
 from .models import Campaign
+import dataclasses
+from pathlib import Path
+from datetime import datetime, date
+
+def _json_default(obj):
+    """
+    Fallback serializer for json.dump so we can handle TextAsset, dataclasses,
+    Paths, datetime, and any custom objects inside a campaign.
+    """
+    # Dataclass objects (TextAsset, Campaign, etc.)
+    if dataclasses.is_dataclass(obj):
+        return dataclasses.asdict(obj)
+
+    # pathlib.Path → string
+    if isinstance(obj, Path):
+        return str(obj)
+
+    # datetime/date → ISO string
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+
+    # SimpleNamespace → dict
+    if isinstance(obj, SimpleNamespace):
+        return vars(obj)
+
+    # Anything else → best-effort string
+    return str(obj)
 
 # Optional image / EXIF support
 try:
@@ -176,6 +200,7 @@ def list_campaigns() -> List[Campaign]:
             continue
     return result
 
+
 def load_campaign(slug: str) -> SimpleNamespace:
     """
     Load a campaign by slug from the canonical structure:
@@ -235,6 +260,55 @@ def load_campaign(slug: str) -> SimpleNamespace:
     return SimpleNamespace(**data)
 
 
+def _to_jsonable(obj):
+    """
+    Recursively convert campaign objects into pure JSON-serializable
+    structures (dicts, lists, strings, numbers, bools, None).
+
+    Handles:
+      - pydantic models (TextAsset, Campaign, etc.)
+      - dataclasses
+      - SimpleNamespace (what load_campaign returns)
+      - Path
+      - datetime/date
+      - nested lists/dicts/tuples/sets containing the above
+    """
+    # --- Pydantic v2 BaseModel-like objects: model_dump() ---
+    if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump", None)):
+        return _to_jsonable(obj.model_dump())
+
+    # --- Pydantic v1 BaseModel-like objects: dict() ---
+    if hasattr(obj, "dict") and callable(getattr(obj, "dict", None)):
+        return _to_jsonable(obj.dict())
+
+    # Dataclasses (e.g., TextAsset if refactored, maybe Campaign)
+    if dataclasses.is_dataclass(obj):
+        return _to_jsonable(dataclasses.asdict(obj))
+
+    # SimpleNamespace -> dict
+    if isinstance(obj, SimpleNamespace):
+        return _to_jsonable(vars(obj))
+
+    # Path -> string
+    if isinstance(obj, Path):
+        return str(obj)
+
+    # datetime/date -> ISO string
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+
+    # Dict -> recurse over values
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+
+    # List/tuple/set -> recurse over items
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(v) for v in obj]
+
+    # Already JSON-serializable (str, int, float, bool, None)
+    return obj
+
+
 def save_campaign(campaign: SimpleNamespace) -> None:
     """
     Save a campaign to:
@@ -246,17 +320,20 @@ def save_campaign(campaign: SimpleNamespace) -> None:
     """
     root = campaigns_dir()
 
-    # Turn whatever we got into a plain dict
-    data = vars(campaign).copy()
+    # Start from the campaign namespace (or similar object)
+    raw_data = vars(campaign).copy()
 
     slug = (
-        data.get("slug")
-        or data.get("name")
-        or data.get("product_name")
+        raw_data.get("slug")
+        or raw_data.get("name")
+        or raw_data.get("product_name")
         or "unnamed-campaign"
     )
     slug = str(slug)
-    data["slug"] = slug
+    raw_data["slug"] = slug
+
+    # Make sure everything inside is JSON-safe
+    data = _to_jsonable(raw_data)
 
     base_dir = root / slug
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -265,7 +342,6 @@ def save_campaign(campaign: SimpleNamespace) -> None:
 
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-
 
 
 def create_campaign(name: str, brief: str) -> Campaign:
@@ -290,7 +366,8 @@ def create_campaign(name: str, brief: str) -> Campaign:
         "updated_at": now,
     }
     campaign = _campaign_from_dict(data)
-    return save_campaign(campaign)
+    save_campaign(campaign)
+    return campaign
 
 
 def delete_campaign(slug: str) -> None:

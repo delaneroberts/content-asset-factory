@@ -1,24 +1,23 @@
 # caf_app/campaign_generator.py
+# caf_app/campaign_generator.py
 
-from __future__ import annotations
+from __future__ import annotations   # ← MUST be first
 
 import json
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from caf_app.utils import slugify, ensure_campaign_dir, ensure_subdir
 from caf_app.text_gen import generate_campaign_texts
-
-# NEW imports: multi-engine image generator
-from caf_app.image_gen import generate_image, save_png
 from caf_app.storage import campaigns_dir
 
 
+
 # ---------------------------------------------------------------------------
-# Result container (unchanged)
+# Result container (for internal typing / clarity)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -26,7 +25,7 @@ class CampaignResult:
     campaign_name: str
     slug: str
     campaign_dir: Path
-    hero_path: Path
+    hero_path: Optional[Path]
     supporting_paths: List[Path]
     zip_path: Path
     text_assets: Dict[str, str]
@@ -34,180 +33,124 @@ class CampaignResult:
 
 
 # ---------------------------------------------------------------------------
-# Image directory helpers (MATCH the Image Library)
+# Directory helpers
 # ---------------------------------------------------------------------------
 
 def _images_base_dir(slug: str) -> Path:
-    """Base images folder for a campaign."""
+    """
+    Base images folder for a campaign: campaigns/<slug>/images
+
+    Even though we are NOT generating images here, we still create
+    this folder so that the Image Library can find the expected
+    structure if/when the user generates images later.
+    """
     return campaigns_dir() / slug / "images"
 
 
-def _generated_dir(slug: str) -> Path:
-    """Generated images go here: campaigns/<slug>/images/generated"""
-    d = _images_base_dir(slug) / "generated"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
 # ---------------------------------------------------------------------------
-# Multi-engine image generation for hero + variants
+# Metadata + ZIP helpers
 # ---------------------------------------------------------------------------
 
-def _generate_hero_image(
+def _write_metadata(
+    campaign_dir: Path,
+    campaign_name: str,
     slug: str,
-    brief: str,
-    engine: str = "auto",
-    size: str = "1024x1024",
+    campaign_brief: str,
+    text_assets: Dict[str, str],
 ) -> Path:
-    """Generate a hero image using the new multi-engine adapter."""
+    """Write a JSON metadata file into the campaign directory."""
 
-    image_bytes, engine_used = generate_image(
-        prompt=brief,
-        engine=engine,
-        size=size,
-    )
+    metadata: Dict[str, Any] = {
+        "campaign_name": campaign_name,
+        "slug": slug,
+        "campaign_brief": campaign_brief,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "text_assets_keys": list(text_assets.keys()),
+        # Hard-coded because THIS module no longer makes images.
+        "has_images": False,
+        "hero_image": None,
+        "supporting_images": [],
+    }
 
-    out_dir = _generated_dir(slug)
-    filename = f"{slug}_hero.png"
-    out_path = out_dir / filename
+    meta_path = campaign_dir / "campaign.json"
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
-    save_png(image_bytes, out_path)
-
-    print(f"[CAF] Hero generated with engine: {engine_used}")
-
-    return out_path
+    return meta_path
 
 
-def _generate_support_images(
-    slug: str,
-    brief: str,
-    num_images: int = 3,
-    engine: str = "auto",
-    size: str = "1024x1024",
-) -> List[Path]:
-    """Generate supporting images using multi-engine adapter."""
-
-    out_dir = _generated_dir(slug)
-    results: List[Path] = []
-
-    for i in range(num_images):
-        image_bytes, engine_used = generate_image(
-            prompt=brief,
-            engine=engine,
-            size=size,
-        )
-
-        ts = int(datetime.utcnow().timestamp() * 1000)
-        filename = f"{slug}_support_{i}_{ts}.png"
-        out_path = out_dir / filename
-
-        save_png(image_bytes, out_path)
-        results.append(out_path)
-
-        print(f"[CAF] Support image {i+1} generated with engine: {engine_used}")
-
-    return results
+def _make_zip_export(slug: str, campaign_dir: Path) -> Path:
+    """Create a ZIP export of the entire campaign directory."""
+    # Archive will be campaigns/<slug>/<slug>.zip
+    base_name = campaign_dir / slug
+    archive_path = shutil.make_archive(str(base_name), "zip", root_dir=campaign_dir)
+    return Path(archive_path)
 
 
 # ---------------------------------------------------------------------------
-# MAIN: generate_campaign()
+# MAIN: generate_campaign()  (TEXT-ONLY, NO IMAGES)
 # ---------------------------------------------------------------------------
 
 def generate_campaign(
     campaign_name: str,
     campaign_brief: str,
-    base_output_dir: Path | None = None,
-    image_engine: str = "auto",       # << NEW: user can choose openai / nanobanana / auto
-    num_supporting: int = 3,          # << NEW: easy to configure
 ) -> Dict[str, Any]:
+    """Generate campaign assets (TEXT ONLY; no images).
+
+    This function now:
+      - Creates / ensures the campaign directory
+      - Ensures an empty images/ folder exists
+      - Generates text assets via generate_campaign_texts
+      - Writes campaign.json metadata with has_images = False
+      - Creates a ZIP archive of the campaign folder
+      - Returns a simple dict used by the Dashboard
     """
-    High-level orchestration for generating a campaign.
 
-    - Create campaign directory under campaigns/<slug>/
-    - Generate text assets
-    - Generate hero + supporting images via multi-engine generator
-    - Save everything the UI needs
-    """
+    # ------------------------------------------------------------------
+    # 1. Slug + campaign directory
+    # ------------------------------------------------------------------
+    slug = slugify(campaign_name)
 
-    # ---------- Slug + folder ----------
-    slug = slugify(campaign_name or "campaign")
-    campaign_dir = ensure_campaign_dir(slug, base_output_dir)
+    # Ensure base campaign directory exists.
+    campaign_dir = ensure_campaign_dir(slug)
 
-    # ---------- Prepare image folders ----------
-    images_dir = ensure_subdir(campaign_dir, "images")
-    # (Sub-directory 'generated' created automatically in generators)
+    # Ensure images/ exists (Image Library expects this structure),
+    # even though we are not generating any images here.
+    images_dir = _images_base_dir(slug)
+    images_dir.mkdir(parents=True, exist_ok=True)
+    ensure_subdir(campaign_dir, "images")  # redundant but harmless if already created
 
-    # ---------- Text generation ----------
-    text_assets = generate_campaign_texts(
+    # ------------------------------------------------------------------
+    # 2. Generate text assets
+    # ------------------------------------------------------------------
+    text_assets: Dict[str, str] = generate_campaign_texts(
+        campaign_name,
+        campaign_brief,
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Metadata + ZIP export
+    # ------------------------------------------------------------------
+    _write_metadata(
+        campaign_dir=campaign_dir,
         campaign_name=campaign_name,
+        slug=slug,
         campaign_brief=campaign_brief,
+        text_assets=text_assets,
     )
 
-    # ---------- Image generation (NEW multi-engine) ----------
-    hero_path = _generate_hero_image(
-        slug=slug,
-        brief=campaign_brief,
-        engine=image_engine,
-    )
+    zip_path = _make_zip_export(slug, campaign_dir)
 
-    supporting_paths = _generate_support_images(
-        slug=slug,
-        brief=campaign_brief,
-        num_images=num_supporting,
-        engine=image_engine,
-    )
-
-    # ---------- Write copy files ----------
-    copy_dir = ensure_subdir(campaign_dir, "copy")
-
-    (copy_dir / "tagline.txt").write_text(text_assets["tagline"], encoding="utf-8")
-    (copy_dir / "slogans.txt").write_text(text_assets["slogans"], encoding="utf-8")
-    (copy_dir / "value_prop.txt").write_text(text_assets["value_prop"], encoding="utf-8")
-    (copy_dir / "ctas.txt").write_text(text_assets["ctas"], encoding="utf-8")
-    (copy_dir / "social_posts.txt").write_text(text_assets["social_posts"], encoding="utf-8")
-    (copy_dir / "campaign_summary.txt").write_text(text_assets["summary"], encoding="utf-8")
-    (copy_dir / "generation_prompts.txt").write_text(text_assets["_prompts"], encoding="utf-8")
-
-    # ---------- Metadata ----------
-    metadata: Dict[str, Any] = {
-        "campaign_name": campaign_name,
-        "slug": slug,
-        "brief": campaign_brief,
-        "created_at": datetime.utcnow().isoformat() + "Z",
-        "image_engine": image_engine,                     # << NEW
-        "images": {
-            "hero": str(hero_path),
-            "supporting": [str(p) for p in supporting_paths],
-        },
-        "copy_files": {name: str(copy_dir / f"{name}.txt")
-                       for name in ["tagline", "slogans", "value_prop",
-                                     "ctas", "social_posts", "campaign_summary"]},
-        "prompts_file": str(copy_dir / "generation_prompts.txt"),
-    }
-
-    metadata_path = campaign_dir / "campaign_metadata.json"
-    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-
-    # ---------- ZIP export ----------
-    zip_path = campaign_dir.with_suffix(".zip")
-    if zip_path.exists():
-        zip_path.unlink()
-
-    shutil.make_archive(
-        base_name=str(campaign_dir),
-        format="zip",
-        root_dir=str(campaign_dir.parent),
-        base_dir=campaign_dir.name,
-    )
-
-    # ---------- Return structure for UI ----------
+    # ------------------------------------------------------------------
+    # 4. Return dict (used by Dashboard)
+    # ------------------------------------------------------------------
     return {
         "campaign_name": campaign_name,
         "slug": slug,
         "campaign_dir": campaign_dir,
-        "hero_path": hero_path,
-        "supporting_paths": supporting_paths,
         "zip_path": zip_path,
         "text_assets": text_assets,
-        "metadata": metadata,
+        # These are kept for compatibility, but will always be empty/None
+        "hero_path": None,
+        "supporting_paths": [],
     }

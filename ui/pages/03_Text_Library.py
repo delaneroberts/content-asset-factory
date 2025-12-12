@@ -1,4 +1,4 @@
-# ui/03_Text_Library.py
+# ui/pages/03_Text_Library.py
 from __future__ import annotations
 
 from typing import List
@@ -8,7 +8,7 @@ from openai import OpenAI
 
 from caf_app.models import Campaign, TextAsset, TextAssetKind
 from caf_app.storage import load_campaign, save_campaign
-
+from types import SimpleNamespace as _SN
 
 client = OpenAI()  # Uses OPENAI_API_KEY from your environment
 
@@ -26,16 +26,23 @@ def _build_base_prompt(campaign: Campaign, kind: TextAssetKind, n_variants: int)
     }[kind]
 
     brief_parts = []
-    if getattr(campaign, "product_name", None):
-        brief_parts.append(f"Product: {campaign.product_name}")
-    if getattr(campaign, "description", None):
-        brief_parts.append(f"Description: {campaign.description}")
-    if getattr(campaign, "audience", None):
-        brief_parts.append(f"Target audience: {campaign.audience}")
-    if getattr(campaign, "tone", None):
-        brief_parts.append(f"Tone/style: {campaign.tone}")
-    if getattr(campaign, "notes", None):
-        brief_parts.append(f"Notes: {campaign.notes}")
+    # Use getattr so older campaigns without these fields don't crash
+    product_name = getattr(campaign, "product_name", None)
+    description = getattr(campaign, "description", None)
+    audience = getattr(campaign, "audience", None)
+    tone = getattr(campaign, "tone", None)
+    notes = getattr(campaign, "notes", None)
+
+    if product_name:
+        brief_parts.append(f"Product: {product_name}")
+    if description:
+        brief_parts.append(f"Description: {description}")
+    if audience:
+        brief_parts.append(f"Target audience: {audience}")
+    if tone:
+        brief_parts.append(f"Tone/style: {tone}")
+    if notes:
+        brief_parts.append(f"Notes: {notes}")
 
     brief_text = "\n".join(brief_parts) or "No additional brief provided."
 
@@ -200,19 +207,6 @@ def main() -> None:
         return
 
     campaign = load_campaign(slug)
-
-    # --- Normalize for new SimpleNamespace-based campaigns -----------------
-    # Some campaigns may not yet have text_assets/image_assets fields.
-    if not hasattr(campaign, "text_assets") or campaign.text_assets is None:
-        campaign.text_assets = []
-    if not hasattr(campaign, "copy_files") or campaign.copy_files is None:
-        campaign.copy_files = {}
-    if not hasattr(campaign, "images") or campaign.images is None:
-        campaign.images = {}
-    if not hasattr(campaign, "image_assets") or campaign.image_assets is None:
-        campaign.image_assets = []
-    # ----------------------------------------------------------------------
-
     if campaign is None:
         st.error(
             f"Could not load campaign with slug `{slug}`. "
@@ -220,7 +214,104 @@ def main() -> None:
         )
         return
 
-    st.caption(f"Campaign: **{campaign.name}** (`{campaign.slug}`)")
+    # --- Normalize for SimpleNamespace-based campaigns ----------------------
+    # Some campaigns may not yet have text_assets/image_assets fields.
+    if not hasattr(campaign, "text_assets") or campaign.text_assets is None:
+        campaign.text_assets = []
+    # Some older versions might have stored text_assets as dict; flatten
+    if isinstance(campaign.text_assets, dict):
+        campaign.text_assets = list(campaign.text_assets.values())
+
+    if not hasattr(campaign, "copy_files") or campaign.copy_files is None:
+        campaign.copy_files = {}
+    if not hasattr(campaign, "images") or campaign.images is None:
+        campaign.images = {}
+    if not hasattr(campaign, "image_assets") or campaign.image_assets is None:
+        campaign.image_assets = []
+    # ------------------------------------------------------------------------
+
+    # --- Normalize individual text_assets entries into TextAsset objects ----
+    normalized_assets: List[TextAsset] = []
+
+    for item in campaign.text_assets:
+        # Already a TextAsset
+        if isinstance(item, TextAsset):
+            normalized_assets.append(item)
+            continue
+
+        # Dict case (JSON-loaded dataclass)
+        if isinstance(item, dict):
+            data = dict(item)  # make a shallow copy
+            src = data.get("source")
+            if src not in ("ai", "manual"):
+                data["source"] = "manual"
+            try:
+                normalized_assets.append(TextAsset(**data))
+                continue
+            except Exception:
+                normalized_assets.append(
+                    TextAsset(
+                        kind=data.get("kind", "body"),
+                        content=data.get("content", str(data)),
+                        source="manual",
+                        prompt=data.get("prompt", ""),
+                        model_name=data.get("model_name", ""),
+                    )
+                )
+                continue
+
+        # SimpleNamespace case
+        if isinstance(item, _SN):
+            d = vars(item)
+            d = dict(d)  # copy so we can safely mutate
+            src = d.get("source")
+            if src not in ("ai", "manual"):
+                d["source"] = "manual"
+            try:
+                normalized_assets.append(TextAsset(**d))
+                continue
+            except Exception:
+                normalized_assets.append(
+                    TextAsset(
+                        kind=d.get("kind", "body"),
+                        content=d.get("content", str(d)),
+                        source="manual",
+                        prompt=d.get("prompt", ""),
+                        model_name=d.get("model_name", ""),
+                    )
+                )
+                continue
+
+        # Legacy plain string
+        if isinstance(item, str):
+            normalized_assets.append(
+                TextAsset(
+                    kind="body",
+                    content=item,
+                    source="manual",
+                    prompt="",
+                    model_name="",
+                )
+            )
+            continue
+
+        # Last resort conversion
+        normalized_assets.append(
+            TextAsset(
+                kind="body",
+                content=str(item),
+                source="manual",
+                prompt="",
+                model_name="",
+            )
+        )
+
+    campaign.text_assets = normalized_assets
+    # ------------------------------------------------------------------------
+
+    # ------------------------------------------------------------------------
+
+    st.caption(f"Campaign: **{getattr(campaign, 'name', slug)}** (`{campaign.slug}`)")
 
     # --- Generation controls -------------------------------------------------
     st.markdown("### ✏️ Generate new copy")
@@ -271,7 +362,9 @@ def main() -> None:
                     campaign.text_assets.extend(new_assets)
                     save_campaign(campaign)
 
-                st.success(f"Added {len(new_assets)} new {kind} variants to this campaign.")
+                st.success(
+                    f"Added {len(new_assets)} new {kind} variants to this campaign."
+                )
                 st.rerun()
 
         st.markdown("</div>", unsafe_allow_html=True)
@@ -291,7 +384,9 @@ def main() -> None:
             index=0,
         )
     with filter_cols[1]:
-        show_only_favorites = st.checkbox("Show only favorites", value=False, help="Show only ★ items")
+        show_only_favorites = st.checkbox(
+            "Show only favorites", value=False, help="Show only ★ items"
+        )
 
     filtered = campaign.text_assets
     if kind_filter != "all":
@@ -323,11 +418,17 @@ def main() -> None:
                         f"<span class='{badge_classes}'><span>●</span>{_kind_badge_label(asset.kind)}</span>",
                         unsafe_allow_html=True,
                     )
-                    meta = asset.created_at.strftime("%Y-%m-%d %H:%M")
-                    st.markdown(
-                        f"<div class='text-card-meta'>Created {meta}</div>",
-                        unsafe_allow_html=True,
-                    )
+                    # created_at might be a datetime on new assets; fallback if missing
+                    created_at = getattr(asset, "created_at", None)
+                    if created_at is not None and hasattr(created_at, "strftime"):
+                        meta = created_at.strftime("%Y-%m-%d %H:%M")
+                    else:
+                        meta = ""
+                    if meta:
+                        st.markdown(
+                            f"<div class='text-card-meta'>Created {meta}</div>",
+                            unsafe_allow_html=True,
+                        )
 
                 with right:
                     col_fav, col_del = st.columns([1, 1])

@@ -22,6 +22,7 @@ from caf_app.models import Campaign  # for type hints / future use
 
 # ---- Custom CSS for gallery improvements ----
 
+#############
 st.markdown("""
 <style>
 /* Add horizontal and vertical spacing between image cards */
@@ -30,55 +31,29 @@ st.markdown("""
     display: flex;
     flex-direction: column;
     align-items: center;
+    border-radius: 10px;
+    border: 1px solid #e5e7eb;  /* default subtle border */
+    background: #ffffff;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
 }
 
-/* Container around the image so we can position the badge */
+/* Gold border for favorites */
+.image-card.favorite {
+    border: 3px solid #fbbf24;      /* gold-ish */
+    box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.35);
+}
+
+/* Container around the image */
 .image-wrapper {
     position: relative;
     display: inline-block;
 }
 
-/* Favorite badge (small yellow star in corner) */
-.favorite-badge {
-    position: absolute;
-    top: 6px;
-    right: 6px;
-    background: rgba(255, 221, 0, 0.85);
-    color: black;
-    font-size: 14px;
-    padding: 2px 6px;
-    border-radius: 6px;
-    font-weight: bold;
-    box-shadow: 0px 0px 4px rgba(0,0,0,0.4);
-}
-
-/* Action bar under each image */
-.image-actions {
-    display: flex;
-    gap: 10px;
-    margin-top: 6px;
-}
-
-/* Make icons look like clickable minimal buttons */
-.action-icon {
-    font-size: 20px;
-    cursor: pointer;
-    padding: 2px 6px;
-    user-select: none;
-}
-
-/* Yellow star when favorited */
-.favorite-active {
-    color: gold;
-}
-
-/* Dim star when not favorited */
-.favorite-inactive {
-    color: #888;
-}
+/* (Removed .favorite-badge – we don't need the floating star anymore) */
 </style>
 """, unsafe_allow_html=True)
 
+##########
 # ---------------------------------------------------------------------------
 # Config / clients
 # ---------------------------------------------------------------------------
@@ -757,7 +732,6 @@ def _render_export_section(slug: str) -> None:
             file_name=f"{slug}_images.zip",
             mime="application/zip",
         )
-
 def _render_gallery(slug: str) -> None:
     st.markdown("### 🖼️ Campaign Image Library")
 
@@ -768,7 +742,7 @@ def _render_gallery(slug: str) -> None:
         st.info("No images yet. Generate or upload images first.")
         return
 
-    # Filter: favorites only
+    # Filter favorites
     show_only_favorites = st.checkbox("Show only favorites", value=False)
     if show_only_favorites:
         images = [p for p in all_images if meta.get(p.name, {}).get("favorite")]
@@ -779,7 +753,7 @@ def _render_gallery(slug: str) -> None:
         st.info("No images match this filter yet.")
         return
 
-    # ---------- Preview + Info panels ----------
+    # ---------- Preview + Info Panels ----------
     preview_key = f"{slug}_preview_image"
     info_key = f"{slug}_info_image"
 
@@ -803,16 +777,21 @@ def _render_gallery(slug: str) -> None:
             st.write(f"**Kind:** {info['kind']}")
         if "engine" in info:
             st.write(f"**Engine:** {info['engine']}")
+
         if "prompt" in info:
             with st.expander("Prompt", expanded=False):
                 st.write(info["prompt"])
+
         if "instructions" in info:
             with st.expander("Instructions", expanded=False):
                 st.write(info["instructions"])
+
         if "base_image" in info:
             st.write(f"**Base image:** `{info['base_image']}`")
+
         if "original_filename" in info:
             st.write(f"**Original filename:** `{info['original_filename']}`")
+
         if "created_at" in info:
             st.write(f"**Created at:** {info['created_at']} (UTC)")
 
@@ -822,52 +801,64 @@ def _render_gallery(slug: str) -> None:
 
         st.markdown("---")
 
-    # ---------- Sorting: selected, favorites, then newest ----------
+    # ---------- Sorting ----------
+    # Do NOT sort by "selected" (keeps layout stable)
     def sort_key(p: Path):
         info = meta.get(p.name, {})
-        selected = bool(info.get("selected"))
         favorite = bool(info.get("favorite"))
-        return (
-            0 if selected else 1,
-            0 if favorite else 1,
-            -p.stat().st_mtime,
-        )
+        return (0 if favorite else 1, -p.stat().st_mtime)
 
     images_sorted = sorted(images, key=sort_key)
 
-    # ---------- CSS for thumbs ----------
-    st.markdown(
-        """
-        <style>
-        .caf-thumb-box {
-            border-radius: 8px;
-            border: 1px solid #ddd;
-            overflow: hidden;
-            width: 200px;
-            height: 200px;
-            margin-bottom: 0.25rem;
-        }
-        .caf-thumb-box img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-        }
-        .caf-link-row button {
-            border: none;
-            background: none;
-            padding: 0 4px;
-            margin: 0;
-            font-size: 0.9rem;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    # ---------- CSS for centered image thumbnails ----------
+    st.markdown("""
+<style>
+.caf-thumb-box {
+    border-radius: 8px;
+    border: 1px solid #ddd;
+    overflow: hidden;
+    width: 200px;
+    height: 200px;
+    margin: 0 auto 0.25rem auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #fafafa;
+}
+.caf-thumb-box img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: center center;
+}
+.caf-link-row button {
+    border: none;
+    background: none;
+    padding: 0 4px;
+    margin: 0;
+    font-size: 0.9rem;
+}
+.favorite-badge {
+    position: absolute;
+    top: 4px;
+    right: 6px;
+    background: rgba(255, 221, 0, 0.85);
+    padding: 2px 6px;
+    border-radius: 6px;
+}
+.image-card {
+    padding-bottom: 10px;
+}
+.image-wrapper {
+    position: relative;
+}
+</style>
+""", unsafe_allow_html=True)
 
-    selection_states: dict[str, bool] = {}
+    selection_states = {}
     meta_changed = False
 
-    # ---------- 4-column grid ----------
+    # ---------- 4-column responsive grid ----------
     cols = st.columns(4)
 
     for idx, img_path in enumerate(images_sorted):
@@ -877,7 +868,6 @@ def _render_gallery(slug: str) -> None:
             favorite = bool(info.get("favorite"))
             selected = bool(info.get("selected"))
 
-            # badges in filename caption
             badge = ""
             if favorite and selected:
                 badge = "⭐✔︎"
@@ -888,108 +878,83 @@ def _render_gallery(slug: str) -> None:
 
             caption = f"{badge} {img_path.name}" if badge else img_path.name
 
-            # ---------- Card wrapper (adds horizontal spacing) ----------
             st.markdown('<div class="image-card">', unsafe_allow_html=True)
 
-            # ---------- Image with optional favorite badge ----------
+            # Image wrapper with star badge
             st.markdown('<div class="image-wrapper">', unsafe_allow_html=True)
+            
+            # (Floating star removed completely)
 
-            if favorite:
-                # little star badge in the corner
-                st.markdown('<div class="favorite-badge">⭐</div>', unsafe_allow_html=True)
-
-            b64_bytes = base64.b64encode(img_path.read_bytes()).decode("utf-8")
+            b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
             st.markdown(
-                f"""
-                <div class="caf-thumb-box">
-                    <img src="data:image/png;base64,{b64_bytes}" />
-                </div>
-                """,
+                f'<div class="caf-thumb-box"><img src="data:image/png;base64,{b64}"></div>',
                 unsafe_allow_html=True,
             )
 
-            st.markdown("</div>", unsafe_allow_html=True)  # close image-wrapper
+            st.markdown('</div>', unsafe_allow_html=True)
 
-            # ---------- Icon controls row: 🔍 / ☆ or ⭐ / ℹ️ ----------
-            with st.container():
-                st.markdown('<div class="caf-link-row">', unsafe_allow_html=True)
-                lc1, lc2, lc3 = st.columns(3)
+            # ---------- Action Icons ----------
+            lc1, lc2, lc3 = st.columns(3)
 
-                # 🔍 View / preview
-                with lc1:
-                    if st.button("🔍", key=f"view_{slug}_{idx}", help="Preview this image"):
-                        st.session_state[preview_key] = str(img_path)
-                        st.rerun()
+            with lc1:
+                if st.button("🔍", key=f"view_{slug}_{img_path.name}"):
+                    st.session_state[preview_key] = str(img_path)
+                    st.rerun()
 
-                # ☆ / ⭐ Favorite toggle (icon shows state)
-                with lc2:
-                    star_label = "⭐" if favorite else "☆"
-                    if st.button(star_label, key=f"fav_{slug}_{idx}", help="Toggle favorite"):
-                        info["favorite"] = not favorite
-                        meta[img_path.name] = info
-                        meta_changed = True
+            with lc2:
+                star_label = "⭐" if favorite else "☆"
+                if st.button(star_label, key=f"fav_{slug}_{img_path.name}"):
+                    info["favorite"] = not favorite
+                    meta[img_path.name] = info
+                    meta_changed = True
 
-                # ℹ️ Info
-                with lc3:
-                    if st.button("ℹ️", key=f"info_{slug}_{idx}", help="Show image details"):
-                        st.session_state[info_key] = img_path.name
-                        st.rerun()
+            with lc3:
+                if st.button("ℹ️", key=f"info_{slug}_{img_path.name}"):
+                    st.session_state[info_key] = img_path.name
+                    st.rerun()
 
-                st.markdown("</div>", unsafe_allow_html=True)
-
-            # ---------- Select checkbox (for variants + bulk delete) ----------
-            sel_key = f"sel_{slug}_{idx}"
-            sel_value = st.checkbox(
-                "Select",
-                key=sel_key,
-                value=selected,
-                help="Use for variant base or bulk delete",
-            )
+            # ---------- Select Checkbox ----------
+            sel_key = f"sel_{slug}_{img_path.name}"
+            sel_value = st.checkbox("Select", key=sel_key, value=selected)
             selection_states[img_path.name] = sel_value
 
             st.caption(caption)
+            st.markdown('</div>', unsafe_allow_html=True)
 
-            st.markdown("</div>", unsafe_allow_html=True)  # close image-card
-
-    # ---------- Sync selection state back into metadata ----------
-    for filename, is_selected in selection_states.items():
+    # ---------- Sync selection metadata ----------
+    for filename, selected in selection_states.items():
         info = meta.get(filename, {})
-        if is_selected and not info.get("selected"):
+        if selected and not info.get("selected"):
             info["selected"] = True
             meta_changed = True
-        if not is_selected and info.get("selected"):
+        if not selected and info.get("selected"):
             info["selected"] = False
             meta_changed = True
         meta[filename] = info
 
-    # ---------- Bulk delete ----------
+    # ---------- Bulk Delete ----------
     if st.button("Delete selected images"):
-        any_deleted = False
-        for idx, img_path in enumerate(images_sorted):
-            name = img_path.name
-            if selection_states.get(name):
-                try:
-                    img_path.unlink()
-                except FileNotFoundError:
-                    pass
-                meta.pop(name, None)
-                any_deleted = True
+        to_delete = [name for name, sel in selection_states.items() if sel]
 
-                sel_key = f"sel_{slug}_{idx}"
-                if sel_key in st.session_state:
-                    st.session_state[sel_key] = False
-
-        if any_deleted:
-            _save_image_metadata(slug, meta)
-            st.success("Deleted selected images.")
-            st.rerun()
+        if not to_delete:
+            st.info("No images selected.")
         else:
-            st.info("No images were selected for deletion.")
+            for img_path in images_sorted:
+                if img_path.name in to_delete:
+                    try:
+                        img_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    meta.pop(img_path.name, None)
 
+            _save_image_metadata(slug, meta)
+            st.success(f"Deleted {len(to_delete)} image(s).")
+            st.rerun()
+
+    # Save metadata after favorites or selection changes
     if meta_changed:
         _save_image_metadata(slug, meta)
         st.rerun()
-
 
 # ---------------------------------------------------------------------------
 # Main
