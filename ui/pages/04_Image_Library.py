@@ -6,17 +6,15 @@ import os
 import time
 from pathlib import Path
 from typing import List, Tuple
-
+from uuid import uuid4
 import io
 import json
 import zipfile
-
 import requests
 import streamlit as st
 from openai import OpenAI, OpenAIError
 from huggingface_hub import InferenceClient
 from PIL import Image
-
 from caf_app.storage import load_campaign
 from caf_app.models import Campaign  # for type hints / future use
 
@@ -133,16 +131,131 @@ def _save_image_metadata(slug: str, metadata: dict) -> None:
 
 
 def _update_image_metadata_entry(slug: str, filename: str, **fields) -> None:
-    """
-    Helper to merge fields into a single image's metadata entry
-    without clobbering existing flags like pinned/favorite.
-    """
     meta = _load_image_metadata(slug)
     info = meta.get(filename, {})
+    if not isinstance(info, dict):
+        info = {}
+
+    # Merge caller fields first
     info.update(fields)
+
+    # Ensure stable identity
+    if not info.get("asset_id"):
+        info["asset_id"] = str(uuid4())
+
+    # If this is a variant, infer lineage from base_image
+    if info.get("kind") == "variant" and info.get("base_image"):
+        base_key = info["base_image"]
+        base_info = meta.get(base_key)
+
+        if isinstance(base_info, dict):
+            base_asset_id = base_info.get("asset_id")
+            base_root_id = base_info.get("root_id") or base_asset_id
+
+            if not info.get("parent_id") and base_asset_id:
+                info["parent_id"] = base_asset_id
+
+            if not info.get("root_id") and base_root_id:
+                info["root_id"] = base_root_id
+            elif info.get("root_id") == info.get("asset_id") and base_root_id:
+                info["root_id"] = base_root_id
+
+            # Derivation default for variants
+            deriv = info.get("derivation")
+            if not isinstance(deriv, dict) or deriv.get("type") in (None, "origin", "unknown"):
+                info["derivation"] = {"type": "variant"}
+
+            # OPTIONAL: workflow provenance for variants (normal case)
+            if "derived_from" not in info:
+                info["derived_from"] = "edit"
+
+        else:
+            # Base missing: keep explicit values if present; otherwise mark unknown
+            if not isinstance(info.get("derivation"), dict):
+                info["derivation"] = {"type": "unknown"}
+            # (optional) leave derived_from unset here
+
+    else:
+        # Origin/non-variant defaults
+        if not info.get("root_id"):
+            info["root_id"] = info["asset_id"]
+        if "parent_id" not in info:
+            info["parent_id"] = None
+        if not isinstance(info.get("derivation"), dict):
+            info["derivation"] = {"type": "origin"}
+
+        # OPTIONAL: provenance for generated origins
+        if info.get("kind") == "generated" and "derived_from" not in info:
+            info["derived_from"] = "prompt"
+
     meta[filename] = info
     _save_image_metadata(slug, meta)
 
+
+def _ensure_image_metadata_schema(meta: dict) -> tuple[dict, bool]:
+    """
+    Ensure each meta[filename] entry has required keys for lineage/versioning.
+    Returns: (possibly-updated meta, changed_flag)
+    """
+    changed = False
+
+    for filename, info in list(meta.items()):
+        if not isinstance(info, dict):
+            meta[filename] = {}
+            info = meta[filename]
+            changed = True
+
+        # Stable identity
+        if not info.get("asset_id"):
+            info["asset_id"] = str(uuid4())
+            changed = True
+
+        # Root identity (origin lineage)
+        if not info.get("root_id"):
+            info["root_id"] = info["asset_id"]
+            changed = True
+
+        # Lineage defaults
+        if "parent_id" not in info:
+            info["parent_id"] = None
+            changed = True
+
+        if "derivation" not in info or not isinstance(info.get("derivation"), dict):
+            info["derivation"] = {"type": "origin"} if info.get("parent_id") is None else {"type": "unknown"}
+            changed = True
+
+        # Versioning defaults
+        if "version" not in info:
+            info["version"] = 1
+            changed = True
+
+        if "is_current" not in info:
+            info["is_current"] = True
+            changed = True
+
+        if "supersedes_id" not in info:
+            info["supersedes_id"] = None
+            changed = True
+
+        # Status (aligns with your inspector)
+        # Prefer existing approval_status if you already use it
+        if "status" not in info:
+            if info.get("approval_status") in ["draft", "approved", "rejected"]:
+                info["status"] = info["approval_status"]
+            else:
+                info["status"] = "draft"
+            changed = True
+
+        # Spec placeholder (future)
+        if "spec" not in info:
+            info["spec"] = None
+            changed = True
+
+        meta[filename] = info
+
+    return meta, changed
+
+#end inset (deleteme)
 
 def _get_current_slug() -> str | None:
     """
@@ -610,13 +723,18 @@ def _render_prompt_generation_ui(slug: str) -> None:
 
             st.success(f"Saved {len(saved_paths)} image(s) to this campaign.")
             st.rerun()
+
 def _render_variant_generation_ui(slug: str) -> None:
     st.markdown("### 🪄 Generate Variants From a Base Image")
 
     with st.expander("Open variant generator", expanded=False):
         all_images = _list_all_images(slug)
         meta = _load_image_metadata(slug)
-
+        #insertion point (Deleteme)
+        meta, ensured = _ensure_image_metadata_schema(meta)
+        if ensured:
+            _save_image_metadata(slug, meta)
+        #insertion point (deleteme)
         # Use selected images (from the gallery checkboxes) as candidates
         selected_images = [p for p in all_images if meta.get(p.name, {}).get("selected")]
 
@@ -732,12 +850,27 @@ def _render_export_section(slug: str) -> None:
             file_name=f"{slug}_images.zip",
             mime="application/zip",
         )
+
+def _title_from_filename(filename: str) -> str:
+    stem = Path(filename).stem  # e.g. "1765562105678" or "evo_orange_hero"
+    if stem.isdigit():
+        return f"Image {stem[-6:]}"
+    pretty = stem.replace("_", " ").replace("-", " ").strip()
+    return pretty.title()
+
 def _render_gallery(slug: str) -> None:
     st.markdown("### 🖼️ Campaign Image Library")
 
     all_images = _list_all_images(slug)
     meta = _load_image_metadata(slug)
-
+    with st.expander("Open variant generator", expanded=False):
+        all_images = _list_all_images(slug)
+        meta = _load_image_metadata(slug)
+#insertion point (Deleteme)
+        meta, ensured = _ensure_image_metadata_schema(meta)
+        if ensured:
+            _save_image_metadata(slug, meta)
+#end insertion point (deleteme)
     if not all_images:
         st.info("No images yet. Generate or upload images first.")
         return
@@ -831,6 +964,12 @@ def _render_gallery(slug: str) -> None:
     object-fit: cover;
     object-position: center center;
 }
+                /* Selected thumbnail highlight */
+.caf-thumb-box.selected {
+    outline: 3px solid rgba(59, 130, 246, 0.9);
+    outline-offset: 2px;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
 .caf-link-row button {
     border: none;
     background: none;
@@ -860,7 +999,6 @@ def _render_gallery(slug: str) -> None:
 
     # ---------- Main layout: gallery (left) + inspector (right) ----------
     gallery_col, inspector_col = st.columns([5, 2], gap="large")
-#indentation conroversy
     with gallery_col:
         # ---------- 4-column responsive grid ----------
         cols = st.columns(4)
@@ -886,17 +1024,23 @@ def _render_gallery(slug: str) -> None:
                 st.markdown('<div class="image-wrapper">', unsafe_allow_html=True)
 
                 b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
+
+                is_active = st.session_state.get("selected_image_name") == img_path.name
+                selected_cls = " selected" if is_active else ""
+
                 st.markdown(
-                    f'<div class="caf-thumb-box"><img src="data:image/png;base64,{b64}"></div>',
+                    f'<div class="caf-thumb-box{selected_cls}"><img src="data:image/png;base64,{b64}"></div>',
                     unsafe_allow_html=True,
                 )
                 st.markdown('</div>', unsafe_allow_html=True)
+
 
                 # ---------- Action Icons ----------
                 lc1, lc2, lc3 = st.columns(3)
 
                 with lc1:
                     if st.button("🔍", key=f"view_{slug}_{img_path.name}"):
+                        st.session_state["selected_image_name"] = img_path.name
                         st.session_state[preview_key] = str(img_path)
                         st.rerun()
 
@@ -920,12 +1064,8 @@ def _render_gallery(slug: str) -> None:
 
                 st.caption(caption)
                 st.markdown('</div>', unsafe_allow_html=True)
-                # END gallery_col
-                # (everything above is inside with gallery_col)
-
-#delane
+    
     with inspector_col:
-
         st.subheader("Inspector")
 
         selected_name = st.session_state.get("selected_image_name")
@@ -935,19 +1075,117 @@ def _render_gallery(slug: str) -> None:
         else:
             info = meta.get(selected_name, {})
 
-            # Find the selected image path by filename
-            selected_path = next((p for p in images_sorted if p.name == selected_name), None)
+            # ---------- Auto-default metadata ----------
+            info_changed = False
 
+            if "title" not in info or not str(info.get("title", "")).strip():
+                info["title"] = _title_from_filename(selected_name)
+                info_changed = True
+
+            valid_types = ["hero", "lifestyle", "product_only", "background", "social", "supporting"]
+            if "asset_type" not in info or info.get("asset_type") not in valid_types:
+                first_name = images_sorted[0].name if images_sorted else ""
+                info["asset_type"] = "hero" if selected_name == first_name else "supporting"
+                info_changed = True
+
+            if "channels" not in info or not isinstance(info.get("channels"), list):
+                info["channels"] = []
+                info_changed = True
+
+            if "approval_status" not in info or info.get("approval_status") not in ["draft", "approved", "rejected"]:
+                info["approval_status"] = "draft"
+                info_changed = True
+
+            if "usage_rights" not in info or info.get("usage_rights") not in ["internal", "external", "paid_media", "unrestricted"]:
+                info["usage_rights"] = "internal"
+                info_changed = True
+
+            if "notes" not in info:
+                info["notes"] = ""
+                info_changed = True
+
+            if info_changed:
+                meta[selected_name] = info
+                meta_changed = True
+
+
+            # ---------- Image preview ----------
+            selected_path = next((p for p in images_sorted if p.name == selected_name), None)
             if selected_path and selected_path.exists():
                 st.image(str(selected_path), use_container_width=True)
 
-            st.markdown("### Provenance (read-only)")
-            st.text_input("Filename", value=selected_name, disabled=True, key=f"ins_fn_{slug}_{selected_name}")
-            st.text_input("Engine", value=str(info.get("engine", "")), disabled=True, key=f"ins_engine_{slug}_{selected_name}")
-            st.text_area("Prompt", value=str(info.get("prompt", "")), disabled=True, height=120, key=f"ins_prompt_{slug}_{selected_name}")
+            # ---------- Provenance (read-only) ----------
+            engine_val = str(info.get("engine", ""))
+            prompt_val = str(info.get("prompt") or info.get("instructions") or "")
 
+            st.markdown("### Provenance (read-only)")
+            st.text_input(
+                "Filename",
+                value=selected_name,
+                disabled=True,
+                key=f"ins_fn_{slug}_{selected_name}",
+            )
+            st.text_input(
+                "Engine",
+                value=engine_val,
+                disabled=True,
+                key=f"ins_engine_{slug}_{selected_name}",
+            )
+            st.text_area(
+                "Prompt / Instructions",
+                value=prompt_val,
+                disabled=True,
+                height=120,
+                key=f"ins_prompt_{slug}_{selected_name}",
+            )
+
+            # ---------- Lineage & Versioning ----------
+            # ---------- Lineage & Versioning (read-only) ----------
+            st.markdown("### Lineage & Versioning (read-only)")
+
+            # Clean read-only fields
+            st.text_input("Kind", value=str(info.get("kind", "")), disabled=True)
+            st.text_input("Asset ID", value=str(info.get("asset_id", "")), disabled=True)
+            st.text_input("Root ID", value=str(info.get("root_id", "")), disabled=True)
+            st.text_input("Parent ID", value=str(info.get("parent_id", "")), disabled=True)
+            st.text_input("Base image", value=str(info.get("base_image", "")), disabled=True)
+            st.text_input(
+                "Derivation",
+                value=str((info.get("derivation") or {}).get("type", "")),
+                disabled=True,
+            )
+            st.text_input("Version", value=str(info.get("version", "")), disabled=True)
+            st.text_input("Current", value=str(info.get("is_current", "")), disabled=True)
+            st.text_input("Supersedes", value=str(info.get("supersedes_id", "")), disabled=True)
+            st.text_input("Created at", value=str(info.get("created_at", "")), disabled=True)
+            st.text_input("Status", value=str(info.get("status", "")), disabled=True)
+
+            # Raw JSON (hidden unless needed)
+            with st.expander("Show raw lineage JSON", expanded=False):
+                st.json({
+                    "kind": info.get("kind"),
+                    "asset_id": info.get("asset_id"),
+                    "root_id": info.get("root_id"),
+                    "parent_id": info.get("parent_id"),
+                    "base_image": info.get("base_image"),
+                    "derivation": info.get("derivation"),
+                    "version": info.get("version"),
+                    "is_current": info.get("is_current"),
+                    "supersedes_id": info.get("supersedes_id"),
+                    "created_at": info.get("created_at"),
+                    "status": info.get("status"),
+                })
+
+
+            # ---------- Metadata (editable) ----------
+            # (your existing editable fields here)
             st.markdown("### Metadata (editable)")
-            title = st.text_input("Title", value=str(info.get("title", "")), key=f"ins_title_{slug}_{selected_name}")
+
+            title = st.text_input(
+                "Title",
+                value=str(info.get("title", "")),
+                key=f"ins_title_{slug}_{selected_name}",
+            )
 
             type_options = ["hero", "lifestyle", "product_only", "background", "social", "supporting"]
             current_type = info.get("asset_type", "supporting")
@@ -969,50 +1207,50 @@ def _render_gallery(slug: str) -> None:
             )
 
             approval_options = ["draft", "approved", "rejected"]
-            current_approval = info.get("approval_status", "draft")
-            if current_approval not in approval_options:
-                current_approval = "draft"
-
             approval_status = st.selectbox(
                 "Approval status",
                 approval_options,
-                index=approval_options.index(current_approval),
+                index=approval_options.index(info.get("approval_status", "draft")),
                 key=f"ins_approval_{slug}_{selected_name}",
             )
 
             rights_options = ["internal", "external", "paid_media", "unrestricted"]
-            current_rights = info.get("usage_rights", "internal")
-            if current_rights not in rights_options:
-                current_rights = "internal"
-
             usage_rights = st.selectbox(
                 "Usage rights",
                 rights_options,
-                index=rights_options.index(current_rights),
+                index=rights_options.index(info.get("usage_rights", "internal")),
                 key=f"ins_rights_{slug}_{selected_name}",
             )
 
-            notes = st.text_area("Notes", value=str(info.get("notes", "")), height=120, key=f"ins_notes_{slug}_{selected_name}")
-
+            notes = st.text_area(
+                "Notes",
+                value=str(info.get("notes", "")),
+                height=120,
+                key=f"ins_notes_{slug}_{selected_name}",
+            )
+            # second save button:
             c1, c2 = st.columns([1, 1])
+
             with c1:
-                if st.button("Save", key=f"ins_save_{slug}_{selected_name}"):
-                    info = meta.get(selected_name, {})
+                if st.button("Save metadata", key=f"ins_save_{slug}_{selected_name}"):
                     info["title"] = title
                     info["asset_type"] = asset_type
                     info["channels"] = channels
                     info["approval_status"] = approval_status
                     info["usage_rights"] = usage_rights
                     info["notes"] = notes
+
                     meta[selected_name] = info
                     meta_changed = True
-                    st.success("Saved.")
+
+                    st.success("Metadata saved.")
 
             with c2:
                 if st.button("Close", key=f"ins_close_{slug}_{selected_name}"):
                     st.session_state["selected_image_name"] = None
                     st.rerun()
 
+            # end second save button
 
     # ---------- Sync selection metadata ----------
     for filename, selected in selection_states.items():
