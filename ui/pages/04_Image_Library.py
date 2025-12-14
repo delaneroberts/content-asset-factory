@@ -724,6 +724,7 @@ def _render_prompt_generation_ui(slug: str) -> None:
             st.success(f"Saved {len(saved_paths)} image(s) to this campaign.")
             st.rerun()
 
+#Only place variants are generated
 def _render_variant_generation_ui(slug: str) -> None:
     st.markdown("### 🪄 Generate Variants From a Base Image")
 
@@ -866,7 +867,7 @@ def _render_gallery(slug: str) -> None:
     meta, ensured = _ensure_image_metadata_schema(meta)
     if ensured:
         _save_image_metadata(slug, meta)
-        
+
     if not all_images:
         st.info("No images yet. Generate or upload images first.")
         return
@@ -1057,7 +1058,28 @@ def _render_gallery(slug: str) -> None:
                 sel_key = f"sel_{slug}_{img_path.name}"
                 sel_value = st.checkbox("Select", key=sel_key, value=selected)
                 selection_states[img_path.name] = sel_value
+#here?
+                # ---------- Read-only lineage badge ----------
+                kind = (info.get("kind") or "").lower()
+                ver = info.get("version", 1)
+                is_current = info.get("is_current", True)
 
+                if kind == "variant":
+                    parent_short = ""
+                    pid = info.get("parent_id")
+                    if pid:
+                        parent_short = str(pid)[:8]  # short display only
+                    badge = f"Variant • v{ver}" + (" • current" if is_current else "")
+                    if parent_short:
+                        badge += f" • parent {parent_short}"
+                elif kind:
+                    badge = f"Origin • v{ver}" + (" • current" if is_current else "")
+                else:
+                    badge = f"v{ver}" + (" • current" if is_current else "")
+
+                st.caption(badge)
+
+#end here
                 st.caption(caption)
                 st.markdown('</div>', unsafe_allow_html=True)
     
@@ -1282,7 +1304,7 @@ def _render_gallery(slug: str) -> None:
     if meta_changed:
         _save_image_metadata(slug, meta)
         st.rerun()
-
+#END OF RENDER GALLERY
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
