@@ -863,14 +863,10 @@ def _render_gallery(slug: str) -> None:
 
     all_images = _list_all_images(slug)
     meta = _load_image_metadata(slug)
-    with st.expander("Open variant generator", expanded=False):
-        all_images = _list_all_images(slug)
-        meta = _load_image_metadata(slug)
-#insertion point (Deleteme)
-        meta, ensured = _ensure_image_metadata_schema(meta)
-        if ensured:
-            _save_image_metadata(slug, meta)
-#end insertion point (deleteme)
+    meta, ensured = _ensure_image_metadata_schema(meta)
+    if ensured:
+        _save_image_metadata(slug, meta)
+        
     if not all_images:
         st.info("No images yet. Generate or upload images first.")
         return
