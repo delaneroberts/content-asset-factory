@@ -64,9 +64,43 @@ HF_NANOBANANA_MODEL_ID = os.getenv("HF_NANOBANANA_MODEL_ID")
 
 
 # ---------------------------------------------------------------------------
+# Superceed helper
+# ---------------------------------------------------------------------------
+def _supersede_asset(meta: dict, old_asset_id: str, new_filename: str) -> dict:
+    """
+    Mark a new file as the next version of an existing asset.
+    """
+    # Find the old record by asset_id
+    old_name = None
+    old_info = None
+    for fn, info in meta.items():
+        if isinstance(info, dict) and info.get("asset_id") == old_asset_id:
+            old_name, old_info = fn, info
+            break
+
+    if not old_info:
+        return meta  # nothing to do
+
+    # Flip old to not-current
+    old_info["is_current"] = False
+    meta[old_name] = old_info
+
+    # Initialize new (assumes it already exists in meta)
+    new_info = meta.get(new_filename, {})
+    if not isinstance(new_info, dict):
+        new_info = {}
+
+    new_info["root_id"] = old_info.get("root_id") or old_info.get("asset_id")
+    new_info["supersedes_id"] = old_info.get("asset_id")
+    new_info["version"] = int(old_info.get("version", 1)) + 1
+    new_info["is_current"] = True
+
+    meta[new_filename] = new_info
+    return meta
+
+# ---------------------------------------------------------------------------
 # Path + metadata helpers
 # ---------------------------------------------------------------------------
-
 
 def _project_root() -> Path:
     """
@@ -1058,7 +1092,6 @@ def _render_gallery(slug: str) -> None:
                 sel_key = f"sel_{slug}_{img_path.name}"
                 sel_value = st.checkbox("Select", key=sel_key, value=selected)
                 selection_states[img_path.name] = sel_value
-#here?
                 # ---------- Read-only lineage badge ----------
                 kind = (info.get("kind") or "").lower()
                 ver = info.get("version", 1)
@@ -1078,8 +1111,6 @@ def _render_gallery(slug: str) -> None:
                     badge = f"v{ver}" + (" • current" if is_current else "")
 
                 st.caption(badge)
-
-#end here
                 st.caption(caption)
                 st.markdown('</div>', unsafe_allow_html=True)
     
@@ -1131,7 +1162,57 @@ def _render_gallery(slug: str) -> None:
             selected_path = next((p for p in images_sorted if p.name == selected_name), None)
             if selected_path and selected_path.exists():
                 st.image(str(selected_path), use_container_width=True)
+#insertion point (deleteme)
+            # ---------- Versioning actions (MVP) ----------
+            st.markdown("### Versioning (actions)")
 
+            root_id = info.get("root_id") or info.get("asset_id")
+
+            cA, cB = st.columns([1, 1])
+
+            with cA:
+                if st.button("✅ Make Current Version", key=f"make_current_{slug}_{selected_name}"):
+                    # Reload fresh metadata to avoid stale info
+                    meta2 = _load_image_metadata(slug)
+
+                    # Determine root_id from selected file (fresh)
+                    sel_info = meta2.get(selected_name, {}) if isinstance(meta2.get(selected_name, {}), dict) else {}
+                    sel_root = sel_info.get("root_id") or sel_info.get("asset_id")
+#Insertion point (deleteme)
+                    if not sel_root:
+                        st.error("Selected image is missing asset_id/root_id; cannot version.")
+                        if not sel_root:
+                            st.error("Selected image is missing asset_id/root_id; cannot version.")
+                            st.stop()
+#end insertion point (deleteme)
+                    # Flip all in same lineage to not-current
+                    changed_any = False
+                    for fn, inf in meta2.items():
+                        if not isinstance(inf, dict):
+                            continue
+                        rid = inf.get("root_id") or inf.get("asset_id")
+                        if rid == sel_root and inf.get("is_current") is True:
+                            inf["is_current"] = False
+                            meta2[fn] = inf
+                            changed_any = True
+
+                    # Mark selected as current
+                    if isinstance(sel_info, dict):
+                        if "version" not in sel_info:
+                            sel_info["version"] = 1
+                        sel_info["is_current"] = True
+                        meta2[selected_name] = sel_info
+                        changed_any = True
+
+                    if changed_any:
+                        _save_image_metadata(slug, meta2)
+                        st.success("Marked as current.")
+                        st.rerun()
+
+            with cB:
+                st.caption(f"Root: {str(root_id)[:8] if root_id else ''}")
+
+#end insertion point (deleteme)
             # ---------- Provenance (read-only) ----------
             engine_val = str(info.get("engine", ""))
             prompt_val = str(info.get("prompt") or info.get("instructions") or "")
