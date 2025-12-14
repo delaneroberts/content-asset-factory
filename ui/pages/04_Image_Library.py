@@ -64,8 +64,46 @@ HF_NANOBANANA_MODEL_ID = os.getenv("HF_NANOBANANA_MODEL_ID")
 
 
 # ---------------------------------------------------------------------------
-# Superceed helper
+# Superceed, versining helpers
 # ---------------------------------------------------------------------------
+
+def _auto_promote_current_after_delete(meta: dict, affected_root_ids: set[str]) -> dict:
+    """
+    If the current asset in a lineage was deleted, promote the highest-version
+    remaining sibling (same root_id) to is_current=True.
+    """
+    for rid in affected_root_ids:
+        # gather remaining siblings
+        siblings = []
+        for fn, info in meta.items():
+            if not isinstance(info, dict):
+                continue
+            root = info.get("root_id") or info.get("asset_id")
+            if root == rid:
+                siblings.append((fn, info))
+
+        if not siblings:
+            continue  # lineage fully deleted
+
+        # pick highest version (default 1 if missing)
+        def vnum(item):
+            info = item[1]
+            try:
+                return int(info.get("version", 1))
+            except Exception:
+                return 1
+
+        best_fn, best_info = max(siblings, key=vnum)
+
+        # set everyone else not-current, best current
+        for fn, info in siblings:
+            info["is_current"] = (fn == best_fn)
+            meta[fn] = info
+
+    return meta
+
+
+
 def _supersede_asset(meta: dict, old_asset_id: str, new_filename: str) -> dict:
     """
     Mark a new file as the next version of an existing asset.
@@ -97,6 +135,66 @@ def _supersede_asset(meta: dict, old_asset_id: str, new_filename: str) -> dict:
 
     meta[new_filename] = new_info
     return meta
+
+def _apply_supersede(meta: dict, new_filename: str) -> dict:
+    """
+    Given metadata where new_filename already exists (and has root_id/asset_id),
+    make it the new current version for its root_id lineage.
+    """
+    new_info = meta.get(new_filename, {})
+    if not isinstance(new_info, dict):
+        return meta
+
+    root_id = new_info.get("root_id") or new_info.get("asset_id")
+    if not root_id:
+        return meta
+
+    # --- HARDENING: find ALL currents in this lineage ---
+    current_candidates = []
+    for fn, info in meta.items():
+        if not isinstance(info, dict):
+            continue
+        rid = info.get("root_id") or info.get("asset_id")
+        if rid == root_id and info.get("is_current") is True:
+            current_candidates.append((fn, info))
+
+    # Choose the highest-version current if multiple exist
+    current_fn = None
+    current_info = None
+    if current_candidates:
+        current_fn, current_info = max(
+            current_candidates,
+            key=lambda x: int(x[1].get("version", 1)),
+        )
+
+    # If new is already current, nothing to do (before clearing flags)
+    if current_fn == new_filename:
+        return meta
+
+    # Clear ALL current flags in this lineage (defensive)
+    for fn, info in meta.items():
+        if not isinstance(info, dict):
+            continue
+        rid = info.get("root_id") or info.get("asset_id")
+        if rid == root_id and info.get("is_current") is True:
+            info["is_current"] = False
+            meta[fn] = info
+
+    # If none marked current, don’t guess too much—just keep new as v1 current
+    if not current_info:
+        new_info.setdefault("version", 1)
+        new_info["is_current"] = True
+        meta[new_filename] = new_info
+        return meta
+
+    # Promote new
+    new_info["supersedes_id"] = current_info.get("asset_id")
+    new_info["version"] = int(current_info.get("version", 1)) + 1
+    new_info["is_current"] = True
+    meta[new_filename] = new_info
+
+    return meta
+
 
 # ---------------------------------------------------------------------------
 # Path + metadata helpers
@@ -820,6 +918,15 @@ def _render_variant_generation_ui(slug: str) -> None:
                 max_value=6,
                 value=2,
             )
+#start insertion point (deleteme)
+
+        supersede_current = st.checkbox(
+            "Treat generated variants as a new version (supersede current)",
+            value=False,
+            key=f"variant_supersede_{slug}",
+        )
+#end insertion point (deleteme)
+
 
         if st.button("Generate improved variants", type="primary"):
             if not base_image_path:
@@ -843,22 +950,27 @@ def _render_variant_generation_ui(slug: str) -> None:
                     st.error(str(e))
                     return
 
-                saved_paths = []
-                for img_bytes in img_bytes_list:
-                    path = _save_image_bytes(slug, img_bytes, generated=True)
-                    saved_paths.append(path)
-                    _update_image_metadata_entry(
-                        slug,
-                        path.name,
-                        kind="variant",
-                        engine=engine,
-                        instructions=instructions.strip(),
-                        base_image=base_image_path.name,
-                        created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    )
+            saved_paths = []
+            for img_bytes in img_bytes_list:
+                path = _save_image_bytes(slug, img_bytes, generated=True)
+                saved_paths.append(path)
 
-            st.success(f"Saved {len(saved_paths)} improved variant(s).")
-            st.rerun()
+                _update_image_metadata_entry(
+                    slug,
+                    path.name,
+                    kind="variant",
+                    engine=engine,
+                    instructions=instructions.strip(),
+                    base_image=base_image_path.name,
+                    created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                )
+
+            # Apply supersede once (last variant wins)
+            if supersede_current and saved_paths:
+                meta2 = _load_image_metadata(slug)
+                meta2 = _apply_supersede(meta2, saved_paths[-1].name)
+                _save_image_metadata(slug, meta2)
+
 
 def _render_export_section(slug: str) -> None:
     st.markdown("### 📦 Export Campaign Images")
@@ -1369,6 +1481,18 @@ def _render_gallery(slug: str) -> None:
         if not to_delete:
             st.info("No images selected.")
         else:
+            # Track which lineages lost their current
+            affected_roots: set[str] = set()
+
+            # Figure out which deleted items were current (and their root_ids)
+            for name in to_delete:
+                info = meta.get(name, {})
+                if isinstance(info, dict) and info.get("is_current") is True:
+                    rid = info.get("root_id") or info.get("asset_id")
+                    if rid:
+                        affected_roots.add(str(rid))
+
+            # Delete files + metadata entries
             for img_path in images_sorted:
                 if img_path.name in to_delete:
                     try:
@@ -1377,15 +1501,20 @@ def _render_gallery(slug: str) -> None:
                         pass
                     meta.pop(img_path.name, None)
 
+            # Auto-promote a new current in any affected lineage
+            if affected_roots:
+                meta = _auto_promote_current_after_delete(meta, affected_roots)
+
             _save_image_metadata(slug, meta)
             st.success(f"Deleted {len(to_delete)} image(s).")
             st.rerun()
+
 
     # Save metadata after favorites or selection changes
     if meta_changed:
         _save_image_metadata(slug, meta)
         st.rerun()
-#END OF RENDER GALLERY
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
