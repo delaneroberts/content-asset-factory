@@ -64,7 +64,7 @@ HF_NANOBANANA_MODEL_ID = os.getenv("HF_NANOBANANA_MODEL_ID")
 
 
 # ---------------------------------------------------------------------------
-# Superceed, versining helpers
+# Superceed, versioning helpers
 # ---------------------------------------------------------------------------
 
 def _auto_promote_current_after_delete(meta: dict, affected_root_ids: set[str]) -> dict:
@@ -261,7 +261,11 @@ def _save_image_metadata(slug: str, metadata: dict) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
-
+# INVARIANT:
+# - asset_id never changes
+# - root_id identifies the lineage origin
+# - parent_id points to the immediate ancestor (if variant)
+# - exactly ONE asset per root_id has is_current == True
 def _update_image_metadata_entry(slug: str, filename: str, **fields) -> None:
     meta = _load_image_metadata(slug)
     info = meta.get(filename, {})
@@ -998,6 +1002,64 @@ def _render_export_section(slug: str) -> None:
             mime="application/zip",
         )
 
+def _gallery_caption(filename: str, meta: dict) -> str:
+    """
+    Human-friendly gallery caption without IDs.
+    Example outputs:
+      - "⭐✔︎ Variant · v3 · Current · derived from v2"
+      - "Original · v1 · Current"
+    """
+    info = meta.get(filename, {})
+    if not isinstance(info, dict):
+        info = {}
+
+    # Favorite / Selected indicators (keep if you like)
+    favorite = bool(info.get("favorite"))
+    selected = bool(info.get("selected"))
+
+    prefix = ""
+    if favorite and selected:
+        prefix = "⭐✔︎ "
+    elif favorite:
+        prefix = "⭐ "
+    elif selected:
+        prefix = "✔︎ "
+
+    kind = (info.get("kind") or "").strip().lower()
+    kind_label = "Variant" if kind == "variant" else "Original"
+
+    # Version / current
+    v = info.get("version")
+    try:
+        v_int = int(v) if v is not None else None
+    except Exception:
+        v_int = None
+
+    parts = [kind_label]
+    if v_int is not None:
+        parts.append(f"v{v_int}")
+
+    if info.get("is_current") is True:
+        parts.append("Current")
+
+    # Derived-from: try to resolve base_image -> its version number
+    base_name = info.get("base_image")
+    if base_name and isinstance(meta.get(base_name), dict):
+        base_info = meta[base_name]
+        base_v = base_info.get("version")
+        try:
+            base_v_int = int(base_v) if base_v is not None else None
+        except Exception:
+            base_v_int = None
+
+        if base_v_int is not None:
+            parts.append(f"derived from v{base_v_int}")
+        else:
+            parts.append("derived from base")
+
+    return prefix + " · ".join(parts)
+
+
 def _title_from_filename(filename: str) -> str:
     stem = Path(filename).stem  # e.g. "1765562105678" or "evo_orange_hero"
     if stem.isdigit():
@@ -1017,17 +1079,35 @@ def _render_gallery(slug: str) -> None:
     if not all_images:
         st.info("No images yet. Generate or upload images first.")
         return
+    
+    # ---------- Filters ----------
+    f1, f2, f3 = st.columns([1.3, 1.6, 2.2])
 
-    # Filter favorites
-    show_only_favorites = st.checkbox("Show only favorites", value=False)
+    with f1:
+        show_only_favorites = st.checkbox("Show only favorites", value=False)
+
+    with f2:
+        show_only_current = st.checkbox("Show only current versions", value=False)
+
+    with f3:
+        type_options = ["All", "hero", "lifestyle", "product_only", "background", "social", "supporting"]
+        selected_type = st.selectbox("Filter by type", type_options, index=0)
+
+    images = all_images
+
     if show_only_favorites:
-        images = [p for p in all_images if meta.get(p.name, {}).get("favorite")]
-    else:
-        images = all_images
+        images = [p for p in images if bool(meta.get(p.name, {}).get("favorite"))]
+
+    if show_only_current:
+        images = [p for p in images if meta.get(p.name, {}).get("is_current") is True]
+
+    if selected_type != "All":
+        images = [p for p in images if meta.get(p.name, {}).get("asset_type") == selected_type]
 
     if not images:
         st.info("No images match this filter yet.")
         return
+
 
     # ---------- Preview + Info Panels ----------
     preview_key = f"{slug}_preview_image"
@@ -1141,42 +1221,40 @@ def _render_gallery(slug: str) -> None:
     meta_changed = False
 
     # ---------- Main layout: gallery (left) + inspector (right) ----------
+    #NEW CODE
     gallery_col, inspector_col = st.columns([5, 2], gap="large")
+
     with gallery_col:
-        # ---------- 4-column responsive grid ----------
         cols = st.columns(4)
 
         for idx, img_path in enumerate(images_sorted):
             col = cols[idx % 4]
+
             with col:
                 info = meta.get(img_path.name, {})
+                caption = _gallery_caption(img_path.name, meta)
                 favorite = bool(info.get("favorite"))
                 selected = bool(info.get("selected"))
 
-                badge = ""
-                if favorite and selected:
-                    badge = "⭐✔︎"
-                elif favorite:
-                    badge = "⭐"
-                elif selected:
-                    badge = "✔︎"
-
-                caption = f"{badge} {img_path.name}" if badge else img_path.name
-
+                # ---- Card wrapper ----
                 st.markdown('<div class="image-card">', unsafe_allow_html=True)
                 st.markdown('<div class="image-wrapper">', unsafe_allow_html=True)
 
+                # ---- Image thumbnail ----
                 b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
-
                 is_active = st.session_state.get("selected_image_name") == img_path.name
                 selected_cls = " selected" if is_active else ""
 
                 st.markdown(
-                    f'<div class="caf-thumb-box{selected_cls}"><img src="data:image/png;base64,{b64}"></div>',
+                    f'''
+                    <div class="caf-thumb-box{selected_cls}">
+                        <img src="data:image/png;base64,{b64}">
+                    </div>
+                    ''',
                     unsafe_allow_html=True,
                 )
-                st.markdown('</div>', unsafe_allow_html=True)
 
+                st.markdown('</div>', unsafe_allow_html=True)  # close image-wrapper
 
                 # ---------- Action Icons ----------
                 lc1, lc2, lc3 = st.columns(3)
@@ -1199,33 +1277,16 @@ def _render_gallery(slug: str) -> None:
                         st.session_state["selected_image_name"] = img_path.name
                         st.rerun()
 
-
                 # ---------- Select Checkbox ----------
                 sel_key = f"sel_{slug}_{img_path.name}"
                 sel_value = st.checkbox("Select", key=sel_key, value=selected)
                 selection_states[img_path.name] = sel_value
-                # ---------- Read-only lineage badge ----------
-                kind = (info.get("kind") or "").lower()
-                ver = info.get("version", 1)
-                is_current = info.get("is_current", True)
 
-                if kind == "variant":
-                    parent_short = ""
-                    pid = info.get("parent_id")
-                    if pid:
-                        parent_short = str(pid)[:8]  # short display only
-                    badge = f"Variant • v{ver}" + (" • current" if is_current else "")
-                    if parent_short:
-                        badge += f" • parent {parent_short}"
-                elif kind:
-                    badge = f"Origin • v{ver}" + (" • current" if is_current else "")
-                else:
-                    badge = f"v{ver}" + (" • current" if is_current else "")
-
-                st.caption(badge)
+                # ---- Caption (NEW logic) ----
                 st.caption(caption)
-                st.markdown('</div>', unsafe_allow_html=True)
-    
+
+                st.markdown('</div>', unsafe_allow_html=True)  # close image-card
+
     with inspector_col:
         st.subheader("Inspector")
 
@@ -1350,7 +1411,6 @@ def _render_gallery(slug: str) -> None:
                 key=f"ins_prompt_{slug}_{selected_name}",
             )
 
-            # ---------- Lineage & Versioning ----------
             # ---------- Lineage & Versioning (read-only) ----------
             st.markdown("### Lineage & Versioning (read-only)")
 
