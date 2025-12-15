@@ -293,59 +293,52 @@ def _update_image_metadata_entry(
     if not isinstance(info, dict):
         info = {}
 
-    # ------------------------------------------------------------------
-    # Core identity fields (always normalized)
-    # ------------------------------------------------------------------
-    info["kind"] = kind
+    origin_like = {"origin", "uploaded", "external"}
+    derivative_like = {"variant", "edit", "resize"}
 
+    # Always set / normalize core fields
+    info["kind"] = kind
     if created_at:
         info["created_at"] = created_at
 
     if asset_id:
         info["asset_id"] = asset_id
 
-    # ------------------------------------------------------------------
-    # Family / lineage
-    # ------------------------------------------------------------------
+    # Persist provided family_id
     if family_id:
         info["family_id"] = family_id
-    elif asset_id and kind in {"origin", "uploaded", "external"}:
-        # origins start their own family
-        info.setdefault("family_id", asset_id)
 
+    # Defaults for origin-like
+    if kind in origin_like and asset_id:
+        info.setdefault("family_id", asset_id)
+        info.setdefault("root_id", asset_id)
+        info.setdefault("parent_id", None)
+
+    # Defaults for derivative-like: root_id must follow the family, not the child’s asset_id
+    if kind in derivative_like:
+        fam = info.get("family_id") or family_id
+        if fam:
+            info["root_id"] = str(fam)
+
+    # Parent linkage when provided (variants should always pass parent_id)
     if parent_id is not None:
         info["parent_id"] = parent_id
 
-    # ------------------------------------------------------------------
-    # Versioning + currentness defaults (CRITICAL FIX)
-    # ------------------------------------------------------------------
-    if kind in {"origin", "uploaded", "external"}:
-        info.setdefault("version", 1)
-        info.setdefault("is_current", True)
-        info.setdefault("supersedes_id", None)
-
-    elif kind == "variant":
-        info.setdefault("version", 1)
-        info.setdefault("is_current", True)
-        info.setdefault("supersedes_id", None)
-
-    # ------------------------------------------------------------------
     # Optional common fields
-    # ------------------------------------------------------------------
     if engine is not None:
         info["engine"] = engine
     if prompt is not None:
         info["prompt"] = prompt
 
-    # ------------------------------------------------------------------
-    # Any extra fields (instructions, base_image, root_id, etc.)
-    # ------------------------------------------------------------------
+    # Extras (instructions, base_image, version, is_current, etc.)
     for k, v in extra.items():
         if v is not None:
             info[k] = v
 
     meta[filename] = info
     _save_image_metadata(slug, meta)
+
+
 
 def _ensure_image_metadata_schema(meta: dict) -> tuple[dict, bool]:
     """
@@ -937,6 +930,114 @@ def _render_upload_section(slug: str) -> None:
                 st.write(f"• ...and {len(failed) - 8} more")
 
         st.rerun()
+def _render_variant_generation_ui(slug: str) -> None:
+    st.markdown("### 🪄 Generate Variants From a Base Image")
+
+    with st.expander("Open variant generator", expanded=False):
+        all_images = _list_all_images(slug)
+
+        meta = _load_image_metadata(slug)
+        meta, ensured = _ensure_image_metadata_schema(meta)
+        if ensured:
+            _save_image_metadata(slug, meta)
+
+        selected_images = [p for p in all_images if meta.get(p.name, {}).get("selected")]
+
+        base_image_path: Path | None = None
+
+        if selected_images:
+            cols = st.columns(min(len(selected_images), 4))
+            for i, p in enumerate(selected_images):
+                with cols[i % len(cols)]:
+                    st.image(str(p), caption=p.name, use_container_width=True)
+
+            base_name = st.radio(
+                "Base image",
+                options=[p.name for p in selected_images],
+                index=0,
+            )
+            base_image_path = next(p for p in selected_images if p.name == base_name)
+        else:
+            st.info("Select an image in the gallery to use as a base.")
+            return
+
+        instructions = st.text_area(
+            "How should we improve this image?",
+            height=100,
+        )
+
+        n_variants = st.slider("Number of variants", 1, 6, 2)
+
+        supersede_current = st.checkbox(
+            "Make this the new current version",
+            value=False,
+        )
+
+        if not st.button("Generate improved variants", type="primary"):
+            return
+
+        if not instructions.strip():
+            st.warning("Please enter instructions.")
+            return
+
+        base_info = meta.get(base_image_path.name, {})
+        base_asset_id = base_info.get("asset_id")
+        base_root_id = base_info.get("root_id") or base_asset_id
+
+        if not base_asset_id or not base_root_id:
+            st.error("Base image missing asset_id/root_id.")
+            return
+
+        # Determine next versions (Option A)
+        def _next_versions(meta: dict, root_id: str, count: int) -> list[int]:
+            max_v = 0
+            for inf in meta.values():
+                if not isinstance(inf, dict):
+                    continue
+                rid = inf.get("root_id") or inf.get("asset_id")
+                if str(rid) == str(root_id):
+                    try:
+                        max_v = max(max_v, int(inf.get("version") or 0))
+                    except Exception:
+                        pass
+            return list(range(max_v + 1, max_v + 1 + count))
+
+        versions = _next_versions(meta, base_root_id, n_variants)
+
+        with st.spinner("Generating variants…"):
+            imgs = _generate_variants_for_engine(
+                "openai",
+                base_image_path,
+                instructions.strip(),
+                n_variants,
+            )
+
+        last_name = None
+
+        for img_bytes, vnum in zip(imgs, versions):
+            path, asset_id = _save_image_bytes(
+                slug,
+                img_bytes,
+                generated=True,
+                kind="variant",
+                engine="openai",
+                prompt=instructions.strip(),
+                parent_asset_id=base_asset_id,
+                family_id=base_root_id,
+                base_image=base_image_path.name,
+                version=vnum,
+                is_current=False,
+            )
+            last_name = path.name
+
+        if supersede_current and last_name:
+            meta2 = _load_image_metadata(slug)
+            meta2 = _apply_supersede(meta2, last_name)
+            _save_image_metadata(slug, meta2)
+
+        st.success("Variants created.")
+        st.rerun()
+
 
 def _render_prompt_generation_ui(slug: str) -> None:
     st.markdown("### 🎨 Generate Images From Prompt")
@@ -986,19 +1087,25 @@ def _render_prompt_generation_ui(slug: str) -> None:
                 except Exception as e:  # noqa: BLE001
                     st.error(str(e))
                     return
+            
+                versions = _next_versions_for_root(meta, str(base_root_id), len(img_bytes_list))
 
                 saved_paths: list[Path] = []
-                for img_bytes in img_bytes_list:
+                #for img_bytes in img_bytes_list:
+                for i, img_bytes in enumerate(img_bytes_list):
+                    vnum = versions[i]
                     # IMPORTANT: engine must be the selected engine (not hard-coded "openai")
-                    path, asset_id = _save_image_bytes(
-                        slug,
-                        img_bytes,
-                        generated=True,
-                        kind="origin",
-                        engine=engine,
-                        prompt=prompt.strip(),
-                    )
+                    for img_bytes in img_bytes_list:
+                        path, asset_id = _save_image_bytes(
+                            slug,
+                            img_bytes,
+                            generated=True,
+                            kind="origin",
+                            engine=engine,
+                            prompt=prompt.strip(),
+                        )
                     saved_paths.append(path)
+
 
                     # No second metadata write here.
                     # _save_image_bytes already:
@@ -1010,153 +1117,86 @@ def _render_prompt_generation_ui(slug: str) -> None:
 
 
 #Only place variants are generated
-def _render_variant_generation_ui(slug: str) -> None:
-    st.markdown("### 🪄 Generate Variants From a Base Image")
+def _render_prompt_generation_ui(slug: str) -> None:
+    st.markdown("### 🎨 Generate Images From Prompt")
 
-    with st.expander("Open variant generator", expanded=False):
-        all_images = _list_all_images(slug)
-
-        # Load + ensure schema (keep this if you rely on schema fields like "selected")
-        meta = _load_image_metadata(slug)
-        meta, ensured = _ensure_image_metadata_schema(meta)
-        if ensured:
-            _save_image_metadata(slug, meta)
-
-        # Selected images from gallery checkboxes
-        selected_images = [p for p in all_images if meta.get(p.name, {}).get("selected")]
-
-        base_image_path: Path | None = None
-
-        if selected_images:
-            st.write("Selected images (choose one as the base):")
-
-            cols = st.columns(min(len(selected_images), 4))
-            for idx, p in enumerate(selected_images):
-                with cols[idx % len(cols)]:
-                    st.image(str(p), caption=p.name, use_container_width=True)
-
-            selected_name = st.radio(
-                "Base image",
-                options=[p.name for p in selected_images],
-                index=0,
-                key=f"variant_base_{slug}",
-            )
-            for p in selected_images:
-                if p.name == selected_name:
-                    base_image_path = p
-                    break
-        else:
-            st.info(
-                "To use a base image, first go to the image gallery below and "
-                "check **Select** under the image you want to use. Then return here."
-            )
-
-        instructions = st.text_area(
-            "How should we improve this image?",
-            placeholder=(
-                "e.g., Improve lighting, modernize the color palette, "
-                "keep composition and main subject."
-            ),
-            height=100,
-            key=f"variant_instr_{slug}",
+    with st.expander("Open generator", expanded=False):
+        prompt = st.text_area(
+            "Prompt",
+            placeholder="Describe the image you want to generate…",
+            height=120,
+            key=f"gen_prompt_{slug}",
         )
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
+
         with col1:
-            st.markdown("**Engine**")
-            st.write("OpenAI (Image Edit – preserves original)")
-            engine = "openai"
+            engine = st.selectbox(
+                "Engine",
+                ["stability", "openai", "nanobanana"],
+                index=0,
+                help="Which image engine to use.",
+                key=f"gen_engine_{slug}",
+            )
 
         with col2:
-            n_variants = st.slider(
-                "Number of variants",
+            n_images = st.slider(
+                "Number of images",
                 min_value=1,
                 max_value=6,
                 value=2,
-                key=f"variant_n_{slug}",
+                key=f"gen_n_{slug}",
             )
 
-        supersede_current = st.checkbox(
-            "Make this the new current version",
-            value=False,
-            key=f"variant_supersede_{slug}",
-        )
+        with col3:
+            size = st.selectbox(
+                "Size (ignored by some engines)",
+                ["1024x1024", "768x768"],
+                index=0,
+                key=f"gen_size_{slug}",
+            )
 
-        if st.button("Generate improved variants", type="primary", key=f"variant_btn_{slug}"):
-            if not base_image_path:
-                st.warning(
-                    "No base image selected. Select at least one image in the gallery and pick it above."
-                )
-                return
-            if not instructions.strip():
-                st.warning("Please describe how to improve the image.")
+        if st.button("Generate images", type="primary", key=f"gen_btn_{slug}"):
+            if not prompt.strip():
+                st.warning("Please enter a prompt.")
                 return
 
-            # Pull parent linkage from legacy meta (this is why we stamped asset_id earlier)
-            base_info = meta.get(base_image_path.name, {})
-            base_asset_id = base_info.get("asset_id")
-            base_family_id = base_info.get("family_id") or base_asset_id
-
-            if not base_asset_id:
-                st.error(
-                    "That base image is missing asset_id in legacy metadata. "
-                    "Generate a new base image (or run a migration/backfill) before creating variants."
-                )
-                return
-
-            with st.spinner(f"Generating {n_variants} improved image(s) with OpenAI…"):
+            with st.spinner(f"Generating {n_images} image(s) with {engine}…"):
                 try:
-                    img_bytes_list = _generate_variants_for_engine(
-                        engine,
-                        base_image_path,
-                        instructions.strip(),
-                        n_variants,
-                    )
-                except Exception as e:
+                    # If your engine supports size, wire it there.
+                    # For now your helper ignores size, so we do too.
+                    img_bytes_list = _generate_images_for_engine(engine, prompt.strip(), n_images)
+                except Exception as e:  # noqa: BLE001
                     st.error(str(e))
                     return
 
-            saved_paths: list[Path] = []
-            last_variant_name: str | None = None
+                saved_paths: list[Path] = []
+                failed: list[str] = []
 
-            for img_bytes in img_bytes_list:
-                # Save as a VARIANT, linked to the base
-                path, asset_id = _save_image_bytes(
-                    slug,
-                    img_bytes,
-                    generated=True,
-                    kind="variant",
-                    engine=engine,
-                    prompt=instructions.strip(),     # store instructions as prompt for now
-                    parent_asset_id=base_asset_id,
-                    family_id=base_family_id,
-                    root_id=base_family_id
-                )
-                saved_paths.append(path)
-                last_variant_name = path.name
+                for idx, img_bytes in enumerate(img_bytes_list, start=1):
+                    try:
+                        # Origin images start NEW families (versioning handled in _save_image_bytes/_update_image_metadata_entry)
+                        path, asset_id = _save_image_bytes(
+                            slug,
+                            img_bytes,
+                            generated=True,
+                            kind="origin",
+                            engine=engine,
+                            prompt=prompt.strip(),
+                        )
+                        saved_paths.append(path)
+                    except Exception as e:  # noqa: BLE001
+                        failed.append(f"Image {idx}: {e}")
 
-                # Add variant-specific fields that _save_image_bytes doesn't write yet
-                # (this is the one "extra" write we keep for now)
-                _update_image_metadata_entry(
-                    slug,
-                    path.name,
-                    kind="variant",
-                    asset_id=asset_id,
-                    family_id=base_family_id,
-                    parent_id=base_asset_id,
-                    engine=engine,
-                    instructions=instructions.strip(),
-                    base_image=base_image_path.name,
-                    created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                )
+            if saved_paths:
+                st.success(f"Saved {len(saved_paths)} image(s) to this campaign.")
+            if failed:
+                st.warning("Some images failed to save:")
+                for msg in failed[:8]:
+                    st.write(f"• {msg}")
+                if len(failed) > 8:
+                    st.write(f"• ...and {len(failed) - 8} more")
 
-            # Apply supersede once (last variant wins)
-            if supersede_current and last_variant_name:
-                meta2 = _load_image_metadata(slug)
-                meta2 = _apply_supersede(meta2, last_variant_name)
-                _save_image_metadata(slug, meta2)
-
-            st.success(f"Saved {len(saved_paths)} variant(s).")
             st.rerun()
 
 
@@ -1279,6 +1319,50 @@ def _render_gallery(slug: str) -> None:
     def family_key_for(p: Path) -> str:
         info = merged_info(p.name)
         return str(info.get("root_id") or info.get("asset_id") or p.name)
+
+    # ---------- NEW: family sorting helpers ----------
+
+    def _version_int(p: Path) -> int:
+        info = merged_info(p.name)
+        try:
+            return int(info.get("version") or 0)
+        except Exception:
+            return 0
+
+    def _is_current(p: Path) -> bool:
+        return bool(merged_info(p.name).get("is_current") is True)
+
+    def _created_at(p: Path) -> str:
+        return str(merged_info(p.name).get("created_at") or "")
+
+    def sort_family_paths(fam_paths: list[Path]) -> list[Path]:
+        """
+        Order within a family:
+          1) Current first
+          2) Higher version first
+          3) Newer created_at first (fallback to file mtime)
+          4) Filename as deterministic fallback
+        """
+        # Pass 1 (stable): newest-first by created_at, fallback to mtime, then name
+        tmp = sorted(
+            fam_paths,
+            key=lambda p: (
+                _created_at(p) or "",
+                p.stat().st_mtime,
+                p.name,
+            ),
+            reverse=True,
+        )
+
+        # Pass 2 (stable): current first, then version desc
+        return sorted(
+            tmp,
+            key=lambda p: (
+                0 if _is_current(p) else 1,
+                -_version_int(p),
+            ),
+        )
+
 
     if ensured:
         _save_image_metadata(slug, meta)
@@ -1546,12 +1630,15 @@ def _render_gallery(slug: str) -> None:
                 families.setdefault(fk, []).append(p)
 
             for fk, fam_paths in families.items():
+                fam_paths = sort_family_paths(fam_paths)
+
                 # Pick a lead for the header: current > origin > first
                 lead = None
                 for p in fam_paths:
-                    if bool(meta.get(p.name, {}).get("is_current")):
+                    if bool(merged_info(p.name).get("is_current") is True):
                         lead = p
                         break
+
                 if lead is None:
                     for p in fam_paths:
                         if merged_info(p.name).get("kind") == "origin":
