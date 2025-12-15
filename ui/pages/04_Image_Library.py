@@ -17,6 +17,9 @@ from huggingface_hub import InferenceClient
 from PIL import Image
 from caf_app.storage import load_campaign
 from caf_app.models import Campaign  # for type hints / future use
+from caf_app.asset_store import AssetStore
+
+ASSET_STORE = AssetStore(campaigns_root=Path("campaigns"))
 
 # ---- Custom CSS for gallery improvements ----
 
@@ -266,67 +269,53 @@ def _save_image_metadata(slug: str, metadata: dict) -> None:
 # - root_id identifies the lineage origin
 # - parent_id points to the immediate ancestor (if variant)
 # - exactly ONE asset per root_id has is_current == True
-def _update_image_metadata_entry(slug: str, filename: str, **fields) -> None:
+def _update_image_metadata_entry(
+    slug: str,
+    filename: str,
+    *,
+    kind: str,
+    created_at: str | None = None,
+    asset_id: str | None = None,
+    family_id: str | None = None,
+    parent_id: str | None = None,
+    engine: str | None = None,
+    prompt: str | None = None,
+    **extra,
+) -> None:
     meta = _load_image_metadata(slug)
     info = meta.get(filename, {})
-    if not isinstance(info, dict):
-        info = {}
+    
+    # Always set/normalize core fields
+    info["kind"] = kind
+    if created_at:
+        info["created_at"] = created_at
 
-    # Merge caller fields first
-    info.update(fields)
+    # Shadow-linkage fields (only when provided)
+    if asset_id:
+        info["asset_id"] = asset_id
 
-    # Ensure stable identity
-    if not info.get("asset_id"):
-        info["asset_id"] = str(uuid4())
+    # If family_id wasn’t passed, default for origins/uploads to asset_id
+    if family_id:
+        info["family_id"] = family_id
+    elif asset_id and kind in ("origin", "uploaded", "external"):
+        info.setdefault("family_id", asset_id)
 
-    # If this is a variant, infer lineage from base_image
-    if info.get("kind") == "variant" and info.get("base_image"):
-        base_key = info["base_image"]
-        base_info = meta.get(base_key)
+    if parent_id:
+        info["parent_id"] = parent_id
 
-        if isinstance(base_info, dict):
-            base_asset_id = base_info.get("asset_id")
-            base_root_id = base_info.get("root_id") or base_asset_id
+    # Optional common fields
+    if engine is not None:
+        info["engine"] = engine
+    if prompt is not None:
+        info["prompt"] = prompt
 
-            if not info.get("parent_id") and base_asset_id:
-                info["parent_id"] = base_asset_id
-
-            if not info.get("root_id") and base_root_id:
-                info["root_id"] = base_root_id
-            elif info.get("root_id") == info.get("asset_id") and base_root_id:
-                info["root_id"] = base_root_id
-
-            # Derivation default for variants
-            deriv = info.get("derivation")
-            if not isinstance(deriv, dict) or deriv.get("type") in (None, "origin", "unknown"):
-                info["derivation"] = {"type": "variant"}
-
-            # OPTIONAL: workflow provenance for variants (normal case)
-            if "derived_from" not in info:
-                info["derived_from"] = "edit"
-
-        else:
-            # Base missing: keep explicit values if present; otherwise mark unknown
-            if not isinstance(info.get("derivation"), dict):
-                info["derivation"] = {"type": "unknown"}
-            # (optional) leave derived_from unset here
-
-    else:
-        # Origin/non-variant defaults
-        if not info.get("root_id"):
-            info["root_id"] = info["asset_id"]
-        if "parent_id" not in info:
-            info["parent_id"] = None
-        if not isinstance(info.get("derivation"), dict):
-            info["derivation"] = {"type": "origin"}
-
-        # OPTIONAL: provenance for generated origins
-        if info.get("kind") == "generated" and "derived_from" not in info:
-            info["derived_from"] = "prompt"
+    # Any extra fields passed in
+    for k, v in extra.items():
+        if v is not None:
+            info[k] = v
 
     meta[filename] = info
     _save_image_metadata(slug, meta)
-
 
 def _ensure_image_metadata_schema(meta: dict) -> tuple[dict, bool]:
     """
@@ -390,8 +379,6 @@ def _ensure_image_metadata_schema(meta: dict) -> tuple[dict, bool]:
         meta[filename] = info
 
     return meta, changed
-
-#end inset (deleteme)
 
 def _get_current_slug() -> str | None:
     """
@@ -636,11 +623,27 @@ def _generate_variants_for_engine(
 # Storage helpers
 # ---------------------------------------------------------------------------
 
-
-def _save_image_bytes(slug: str, img_bytes: bytes, generated: bool = True) -> Path:
+def _save_image_bytes(
+    slug: str,
+    img_bytes: bytes,
+    generated: bool = True,
+    *,
+    kind: str = "origin",                 # origin | variant | resize | edit | external | uploaded
+    engine: str | None = None,
+    prompt: str | None = None,
+    parent_asset_id: str | None = None,   # for variant/resize/edit
+    family_id: str | None = None,         # pass for variant/resize/edit
+    **extra,                               # e.g. instructions="...", base_image="..."
+) -> tuple[Path, str | None]:
     """
-    Save image bytes into the campaign folder and return the Path.
+    Save image bytes into the campaign folder and return (Path, asset_id).
+
     If generated=True, save under images/generated; else under images/.
+
+    Choice A:
+      1) Save bytes to disk
+      2) Upsert to AssetStore (mint/get asset_id)
+      3) Write legacy metadata INCLUDING asset_id/family_id/parent_id (+ any extra fields)
     """
     images_dir, generated_dir = _campaign_dirs(slug)
     target_dir = generated_dir if generated else images_dir
@@ -649,33 +652,118 @@ def _save_image_bytes(slug: str, img_bytes: bytes, generated: bool = True) -> Pa
     filename = f"{ts}.png"
     path = target_dir / filename
 
+    # 1) Save bytes to disk
     with open(path, "wb") as f:
         f.write(img_bytes)
 
-    return path
+    created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+    # 2) Shadow-write to AssetStore (get asset_id)
+    asset_id: str | None = None
+    try:
+        campaign_root = Path("campaigns") / slug
+        rel_image_path = str(path.relative_to(campaign_root))
 
-def _save_uploaded_image(slug: str, uploaded_file) -> Path:
+        record = {
+            "kind": kind,
+            "image_path": rel_image_path,
+            "engine": engine,
+            "prompt": prompt,
+            "parent_id": parent_asset_id,
+            "created_at": created_at,
+        }
+
+        if family_id:
+            record["family_id"] = family_id
+
+        # Optional extra fields can go into AssetStore too (safe; ignored if you don’t use them yet)
+        for k, v in extra.items():
+            if v is not None:
+                record[k] = v
+
+        asset_id = ASSET_STORE.upsert_asset(slug, record)
+
+    except Exception:
+        # Never break the UI because shadow-write failed
+        asset_id = None
+
+    # 3) Decide family_id for legacy meta:
+    #    - Origins/uploads/external start a new family (family_id == asset_id)
+    #    - Derivatives inherit provided family_id
+    origin_like_kinds = {"origin", "uploaded", "external"}
+    legacy_family_id = family_id
+    if not legacy_family_id and asset_id and kind in origin_like_kinds:
+        legacy_family_id = asset_id
+
+    _update_image_metadata_entry(
+        slug,
+        filename,
+        kind=kind,
+        created_at=created_at,
+        asset_id=asset_id,
+        family_id=legacy_family_id,
+        parent_id=parent_asset_id,
+        engine=engine,
+        prompt=prompt,
+        **extra,  # write instructions/base_image/etc into legacy meta in the same call
+    )
+
+    # 4) Return both
+    return path, asset_id
+
+def _save_uploaded_image(slug: str, uploaded_file) -> tuple[Path, str | None]:
     """
-    Save an uploaded image into the base images dir (not generated)
-    and record basic metadata.
+    Save an uploaded image into the base images dir (not generated),
+    then write legacy metadata WITH asset_id (Choice A), and shadow-write AssetStore.
     """
     images_dir, _ = _campaign_dirs(slug)
     suffix = Path(uploaded_file.name).suffix or ".png"
     ts = int(time.time() * 1000)
     filename = f"uploaded_{ts}{suffix}"
     dest = images_dir / filename
+
+    # 1) Save bytes to disk
     with open(dest, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
+    created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    # 2) Shadow-write to AssetStore (get asset_id)
+    asset_id = None
+    try:
+        campaign_root = Path("campaigns") / slug
+        rel_image_path = str(dest.relative_to(campaign_root))
+
+        asset_id = ASSET_STORE.upsert_asset(
+            slug,
+            {
+                "kind": "external",     # or "uploaded" if you prefer
+                "image_path": rel_image_path,
+                "engine": "upload",
+                "prompt": None,
+                "parent_id": None,
+                "created_at": created_at,
+                "original_filename": uploaded_file.name,
+            },
+        )
+    except Exception:
+        pass
+
+    # 3) Now write legacy metadata INCLUDING asset_id/family_id (Choice A)
     _update_image_metadata_entry(
         slug,
         filename,
         kind="uploaded",
         original_filename=uploaded_file.name,
-        created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        created_at=created_at,
+        asset_id=asset_id,
+        family_id=asset_id,  # uploaded/origin starts a new family
+        parent_id=None,
+        engine="upload",
     )
-    return dest
+
+    # 4) Return both so call sites can use it if desired
+    return dest, asset_id
 
 
 def _build_images_zip(slug: str) -> bytes | None:
@@ -790,15 +878,35 @@ def _render_upload_section(slug: str) -> None:
         ),
     )
 
-    if uploaded_files:
-        if st.button("Save uploaded images"):
-            count = 0
-            for f in uploaded_files:
-                _save_uploaded_image(slug, f)
-                count += 1
-            st.success(f"Saved {count} image(s). They now appear in the gallery.")
-            st.rerun()
+    if not uploaded_files:
+        return
 
+    # Small preview / summary
+    st.caption(f"{len(uploaded_files)} file(s) selected.")
+
+    if st.button("Save uploaded images", key=f"save_uploads_{slug}"):
+        saved = 0
+        failed: list[str] = []
+
+        for f in uploaded_files:
+            try:
+                dest, asset_id = _save_uploaded_image(slug, f)
+                # dest.name is available if you want to log/debug, but not needed here
+                saved += 1
+            except Exception as e:
+                failed.append(f"{getattr(f, 'name', 'unknown')}: {e}")
+
+        if saved:
+            st.success(f"Saved {saved} image(s). They now appear in the gallery.")
+
+        if failed:
+            st.warning("Some uploads failed:")
+            for msg in failed[:8]:
+                st.write(f"• {msg}")
+            if len(failed) > 8:
+                st.write(f"• ...and {len(failed) - 8} more")
+
+        st.rerun()
 
 def _render_prompt_generation_ui(slug: str) -> None:
     st.markdown("### 🎨 Generate Images From Prompt")
@@ -808,6 +916,7 @@ def _render_prompt_generation_ui(slug: str) -> None:
             "Prompt",
             placeholder="Describe the image you want to generate…",
             height=120,
+            key=f"gen_prompt_{slug}",
         )
 
         col1, col2, col3 = st.columns(3)
@@ -817,6 +926,7 @@ def _render_prompt_generation_ui(slug: str) -> None:
                 ["stability", "openai", "nanobanana"],
                 index=0,
                 help="Which image engine to use.",
+                key=f"gen_engine_{slug}",
             )
         with col2:
             n_images = st.slider(
@@ -824,41 +934,50 @@ def _render_prompt_generation_ui(slug: str) -> None:
                 min_value=1,
                 max_value=6,
                 value=2,
+                key=f"gen_n_{slug}",
             )
         with col3:
             size = st.selectbox(
                 "Size (ignored by some engines)",
                 ["1024x1024", "768x768"],
                 index=0,
+                key=f"gen_size_{slug}",
             )
 
-        if st.button("Generate images", type="primary"):
+        if st.button("Generate images", type="primary", key=f"gen_btn_{slug}"):
             if not prompt.strip():
                 st.warning("Please enter a prompt.")
                 return
 
             with st.spinner(f"Generating {n_images} image(s) with {engine}…"):
                 try:
-                    img_bytes_list = _generate_images_for_engine(engine, prompt, n_images)
+                    # If your engine function uses size, pass it; otherwise ignore.
+                    img_bytes_list = _generate_images_for_engine(engine, prompt.strip(), n_images)
                 except Exception as e:  # noqa: BLE001
                     st.error(str(e))
                     return
 
-                saved_paths = []
+                saved_paths: list[Path] = []
                 for img_bytes in img_bytes_list:
-                    path = _save_image_bytes(slug, img_bytes, generated=True)
-                    saved_paths.append(path)
-                    _update_image_metadata_entry(
+                    # IMPORTANT: engine must be the selected engine (not hard-coded "openai")
+                    path, asset_id = _save_image_bytes(
                         slug,
-                        path.name,
-                        kind="generated",
+                        img_bytes,
+                        generated=True,
+                        kind="origin",
                         engine=engine,
                         prompt=prompt.strip(),
-                        created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     )
+                    saved_paths.append(path)
+
+                    # No second metadata write here.
+                    # _save_image_bytes already:
+                    # - upserts AssetStore
+                    # - writes legacy metadata including asset_id/family_id
 
             st.success(f"Saved {len(saved_paths)} image(s) to this campaign.")
             st.rerun()
+
 
 #Only place variants are generated
 def _render_variant_generation_ui(slug: str) -> None:
@@ -866,13 +985,14 @@ def _render_variant_generation_ui(slug: str) -> None:
 
     with st.expander("Open variant generator", expanded=False):
         all_images = _list_all_images(slug)
+
+        # Load + ensure schema (keep this if you rely on schema fields like "selected")
         meta = _load_image_metadata(slug)
-        #insertion point (Deleteme)
         meta, ensured = _ensure_image_metadata_schema(meta)
         if ensured:
             _save_image_metadata(slug, meta)
-        #insertion point (deleteme)
-        # Use selected images (from the gallery checkboxes) as candidates
+
+        # Selected images from gallery checkboxes
         selected_images = [p for p in all_images if meta.get(p.name, {}).get("selected")]
 
         base_image_path: Path | None = None
@@ -889,6 +1009,7 @@ def _render_variant_generation_ui(slug: str) -> None:
                 "Base image",
                 options=[p.name for p in selected_images],
                 index=0,
+                key=f"variant_base_{slug}",
             )
             for p in selected_images:
                 if p.name == selected_name:
@@ -907,6 +1028,7 @@ def _render_variant_generation_ui(slug: str) -> None:
                 "keep composition and main subject."
             ),
             height=100,
+            key=f"variant_instr_{slug}",
         )
 
         col1, col2 = st.columns(2)
@@ -921,18 +1043,16 @@ def _render_variant_generation_ui(slug: str) -> None:
                 min_value=1,
                 max_value=6,
                 value=2,
+                key=f"variant_n_{slug}",
             )
-#start insertion point (deleteme)
 
         supersede_current = st.checkbox(
             "Treat generated variants as a new version (supersede current)",
             value=False,
             key=f"variant_supersede_{slug}",
         )
-#end insertion point (deleteme)
 
-
-        if st.button("Generate improved variants", type="primary"):
+        if st.button("Generate improved variants", type="primary", key=f"variant_btn_{slug}"):
             if not base_image_path:
                 st.warning(
                     "No base image selected. Select at least one image in the gallery and pick it above."
@@ -940,6 +1060,18 @@ def _render_variant_generation_ui(slug: str) -> None:
                 return
             if not instructions.strip():
                 st.warning("Please describe how to improve the image.")
+                return
+
+            # Pull parent linkage from legacy meta (this is why we stamped asset_id earlier)
+            base_info = meta.get(base_image_path.name, {})
+            base_asset_id = base_info.get("asset_id")
+            base_family_id = base_info.get("family_id") or base_asset_id
+
+            if not base_asset_id:
+                st.error(
+                    "That base image is missing asset_id in legacy metadata. "
+                    "Generate a new base image (or run a migration/backfill) before creating variants."
+                )
                 return
 
             with st.spinner(f"Generating {n_variants} improved image(s) with OpenAI…"):
@@ -954,15 +1086,33 @@ def _render_variant_generation_ui(slug: str) -> None:
                     st.error(str(e))
                     return
 
-            saved_paths = []
-            for img_bytes in img_bytes_list:
-                path = _save_image_bytes(slug, img_bytes, generated=True)
-                saved_paths.append(path)
+            saved_paths: list[Path] = []
+            last_variant_name: str | None = None
 
+            for img_bytes in img_bytes_list:
+                # Save as a VARIANT, linked to the base
+                path, asset_id = _save_image_bytes(
+                    slug,
+                    img_bytes,
+                    generated=True,
+                    kind="variant",
+                    engine=engine,
+                    prompt=instructions.strip(),     # store instructions as prompt for now
+                    parent_asset_id=base_asset_id,
+                    family_id=base_family_id,
+                )
+                saved_paths.append(path)
+                last_variant_name = path.name
+
+                # Add variant-specific fields that _save_image_bytes doesn't write yet
+                # (this is the one "extra" write we keep for now)
                 _update_image_metadata_entry(
                     slug,
                     path.name,
                     kind="variant",
+                    asset_id=asset_id,
+                    family_id=base_family_id,
+                    parent_id=base_asset_id,
                     engine=engine,
                     instructions=instructions.strip(),
                     base_image=base_image_path.name,
@@ -970,10 +1120,13 @@ def _render_variant_generation_ui(slug: str) -> None:
                 )
 
             # Apply supersede once (last variant wins)
-            if supersede_current and saved_paths:
+            if supersede_current and last_variant_name:
                 meta2 = _load_image_metadata(slug)
-                meta2 = _apply_supersede(meta2, saved_paths[-1].name)
+                meta2 = _apply_supersede(meta2, last_variant_name)
                 _save_image_metadata(slug, meta2)
+
+            st.success(f"Saved {len(saved_paths)} variant(s).")
+            st.rerun()
 
 
 def _render_export_section(slug: str) -> None:
@@ -1335,7 +1488,6 @@ def _render_gallery(slug: str) -> None:
             selected_path = next((p for p in images_sorted if p.name == selected_name), None)
             if selected_path and selected_path.exists():
                 st.image(str(selected_path), use_container_width=True)
-#insertion point (deleteme)
             # ---------- Versioning actions (MVP) ----------
             st.markdown("### Versioning (actions)")
 
@@ -1351,13 +1503,11 @@ def _render_gallery(slug: str) -> None:
                     # Determine root_id from selected file (fresh)
                     sel_info = meta2.get(selected_name, {}) if isinstance(meta2.get(selected_name, {}), dict) else {}
                     sel_root = sel_info.get("root_id") or sel_info.get("asset_id")
-#Insertion point (deleteme)
                     if not sel_root:
                         st.error("Selected image is missing asset_id/root_id; cannot version.")
                         if not sel_root:
                             st.error("Selected image is missing asset_id/root_id; cannot version.")
                             st.stop()
-#end insertion point (deleteme)
                     # Flip all in same lineage to not-current
                     changed_any = False
                     for fn, inf in meta2.items():
@@ -1385,7 +1535,7 @@ def _render_gallery(slug: str) -> None:
             with cB:
                 st.caption(f"Root: {str(root_id)[:8] if root_id else ''}")
 
-#end insertion point (deleteme)
+
             # ---------- Provenance (read-only) ----------
             engine_val = str(info.get("engine", ""))
             prompt_val = str(info.get("prompt") or info.get("instructions") or "")
