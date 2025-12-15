@@ -1,21 +1,22 @@
 # tools/rebuild_assets_index.py
-from pathlib import Path
-import sys
+from __future__ import annotations
 
-from caf_app.asset_store import AssetStore
+import argparse
+from caf_app.asset_store import assets_index_path, rebuild_assets_index
 
-def main() -> int:
-    if len(sys.argv) != 2:
-        print("Usage: python tools/rebuild_assets_index.py <campaign_slug>")
-        return 2
 
-    slug = sys.argv[1]
-    campaigns_root = Path("campaigns")  # adjust if your root differs
-    store = AssetStore(campaigns_root=campaigns_root)
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Reindex a CAF campaign's assets_index.json (MVP).")
+    ap.add_argument("--campaign", "-c", required=True, help="Campaign slug")
+    args = ap.parse_args()
 
-    n, skipped = store.rebuild_index(slug)
-    print(f"Rebuilt index for '{slug}': {n} assets ({skipped} skipped)")
-    return 0
+    warnings = rebuild_assets_index(args.campaign)
+    print(f"Wrote: {assets_index_path(args.campaign)}")
+    if warnings:
+        print("\nWarnings:")
+        for w in warnings:
+            print(f" - {w}")
+
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
