@@ -18,6 +18,7 @@ from PIL import Image
 from caf_app.storage import load_campaign
 from caf_app.models import Campaign  # for type hints / future use
 from caf_app.asset_store import AssetStore
+from caf_app.asset_store import load_assets_index
 
 ASSET_STORE = AssetStore(campaigns_root=Path("campaigns"))
 
@@ -69,6 +70,11 @@ HF_NANOBANANA_MODEL_ID = os.getenv("HF_NANOBANANA_MODEL_ID")
 # ---------------------------------------------------------------------------
 # Superceed, versioning helpers
 # ---------------------------------------------------------------------------
+
+#def family_key_for(p: Path) -> str:
+#    info = merged_info(p.name)
+#    # Prefer root_id from assets_index; fallback to asset_id; then filename
+#    return str(info.get("root_id") or info.get("asset_id") or p.name)
 
 def _auto_promote_current_after_delete(meta: dict, affected_root_ids: set[str]) -> dict:
     """
@@ -284,32 +290,56 @@ def _update_image_metadata_entry(
 ) -> None:
     meta = _load_image_metadata(slug)
     info = meta.get(filename, {})
-    
-    # Always set/normalize core fields
+    if not isinstance(info, dict):
+        info = {}
+
+    # ------------------------------------------------------------------
+    # Core identity fields (always normalized)
+    # ------------------------------------------------------------------
     info["kind"] = kind
+
     if created_at:
         info["created_at"] = created_at
 
-    # Shadow-linkage fields (only when provided)
     if asset_id:
         info["asset_id"] = asset_id
 
-    # If family_id wasn’t passed, default for origins/uploads to asset_id
+    # ------------------------------------------------------------------
+    # Family / lineage
+    # ------------------------------------------------------------------
     if family_id:
         info["family_id"] = family_id
-    elif asset_id and kind in ("origin", "uploaded", "external"):
+    elif asset_id and kind in {"origin", "uploaded", "external"}:
+        # origins start their own family
         info.setdefault("family_id", asset_id)
 
-    if parent_id:
+    if parent_id is not None:
         info["parent_id"] = parent_id
 
+    # ------------------------------------------------------------------
+    # Versioning + currentness defaults (CRITICAL FIX)
+    # ------------------------------------------------------------------
+    if kind in {"origin", "uploaded", "external"}:
+        info.setdefault("version", 1)
+        info.setdefault("is_current", True)
+        info.setdefault("supersedes_id", None)
+
+    elif kind == "variant":
+        info.setdefault("version", 1)
+        info.setdefault("is_current", True)
+        info.setdefault("supersedes_id", None)
+
+    # ------------------------------------------------------------------
     # Optional common fields
+    # ------------------------------------------------------------------
     if engine is not None:
         info["engine"] = engine
     if prompt is not None:
         info["prompt"] = prompt
 
-    # Any extra fields passed in
+    # ------------------------------------------------------------------
+    # Any extra fields (instructions, base_image, root_id, etc.)
+    # ------------------------------------------------------------------
     for k, v in extra.items():
         if v is not None:
             info[k] = v
@@ -1047,7 +1077,7 @@ def _render_variant_generation_ui(slug: str) -> None:
             )
 
         supersede_current = st.checkbox(
-            "Treat generated variants as a new version (supersede current)",
+            "Make this the new current version",
             value=False,
             key=f"variant_supersede_{slug}",
         )
@@ -1100,6 +1130,7 @@ def _render_variant_generation_ui(slug: str) -> None:
                     prompt=instructions.strip(),     # store instructions as prompt for now
                     parent_asset_id=base_asset_id,
                     family_id=base_family_id,
+                    root_id=base_family_id
                 )
                 saved_paths.append(path)
                 last_variant_name = path.name
@@ -1155,20 +1186,17 @@ def _render_export_section(slug: str) -> None:
             mime="application/zip",
         )
 
-def _gallery_caption(filename: str, meta: dict) -> str:
-    """
-    Human-friendly gallery caption without IDs.
-    Example outputs:
-      - "⭐✔︎ Variant · v3 · Current · derived from v2"
-      - "Original · v1 · Current"
-    """
-    info = meta.get(filename, {})
+def _gallery_caption(filename: str, meta: dict, info_override: dict | None = None) -> str:
+    info = info_override or meta.get(filename, {})
     if not isinstance(info, dict):
         info = {}
 
-    # Favorite / Selected indicators (keep if you like)
-    favorite = bool(info.get("favorite"))
-    selected = bool(info.get("selected"))
+    legacy = meta.get(filename, {})
+    if not isinstance(legacy, dict):
+        legacy = {}
+
+    favorite = bool(legacy.get("favorite"))
+    selected = bool(legacy.get("selected"))
 
     prefix = ""
     if favorite and selected:
@@ -1181,8 +1209,8 @@ def _gallery_caption(filename: str, meta: dict) -> str:
     kind = (info.get("kind") or "").strip().lower()
     kind_label = "Variant" if kind == "variant" else "Original"
 
-    # Version / current
-    v = info.get("version")
+    # Version / current (use legacy because those are UI/workflow fields)
+    v = legacy.get("version")
     try:
         v_int = int(v) if v is not None else None
     except Exception:
@@ -1192,10 +1220,10 @@ def _gallery_caption(filename: str, meta: dict) -> str:
     if v_int is not None:
         parts.append(f"v{v_int}")
 
-    if info.get("is_current") is True:
+    if legacy.get("is_current") is True:
         parts.append("Current")
 
-    # Derived-from: try to resolve base_image -> its version number
+    # Derived-from: base_image likely comes from index (info), but base version is in legacy meta
     base_name = info.get("base_image")
     if base_name and isinstance(meta.get(base_name), dict):
         base_info = meta[base_name]
@@ -1226,6 +1254,32 @@ def _render_gallery(slug: str) -> None:
     all_images = _list_all_images(slug)
     meta = _load_image_metadata(slug)
     meta, ensured = _ensure_image_metadata_schema(meta)
+
+    # --- NEW: Load canonical asset index (read-only enrichment) ---
+    assets_index = load_assets_index(slug)  # asset_id -> record
+    index_by_filename = {
+        rec.get("filename"): rec for rec in assets_index.values()
+        if isinstance(rec, dict) and rec.get("filename")
+    }
+
+    def merged_info(filename: str) -> dict:
+        """
+        Combine canonical index info + legacy per-filename meta.
+        Canonical fields come from assets_index; UI flags come from legacy meta.
+        Legacy meta wins on conflicts so favorites/selected/etc stay editable.
+        """
+        idx = index_by_filename.get(filename, {})
+        legacy = meta.get(filename, {})
+        if not isinstance(legacy, dict):
+            legacy = {}
+        if not isinstance(idx, dict):
+            idx = {}
+        return {**idx, **legacy}
+    
+    def family_key_for(p: Path) -> str:
+        info = merged_info(p.name)
+        return str(info.get("root_id") or info.get("asset_id") or p.name)
+
     if ensured:
         _save_image_metadata(slug, meta)
 
@@ -1234,7 +1288,7 @@ def _render_gallery(slug: str) -> None:
         return
     
     # ---------- Filters ----------
-    f1, f2, f3 = st.columns([1.3, 1.6, 2.2])
+    f1, f2, f3, f4 = st.columns([1.2, 1.6, 2.2, 1.6])
 
     with f1:
         show_only_favorites = st.checkbox("Show only favorites", value=False)
@@ -1245,6 +1299,10 @@ def _render_gallery(slug: str) -> None:
     with f3:
         type_options = ["All", "hero", "lifestyle", "product_only", "background", "social", "supporting"]
         selected_type = st.selectbox("Filter by type", type_options, index=0)
+
+    with f4:
+        group_by_family = st.checkbox("Group by asset family", value=True)
+
 
     images = all_images
 
@@ -1277,8 +1335,43 @@ def _render_gallery(slug: str) -> None:
             st.rerun()
         st.markdown("---")
 
-    if info_name and info_name in meta:
-        info = meta[info_name]
+        if info_name:
+            info = merged_info(info_name)
+            if info:
+                st.markdown("#### ℹ️ Image info")
+                st.write(f"**File:** `{info_name}`")
+
+                if "kind" in info:
+                    st.write(f"**Kind:** {info['kind']}")
+                if "engine" in info:
+                    st.write(f"**Engine:** {info['engine']}")
+
+                if "prompt" in info:
+                    with st.expander("Prompt", expanded=False):
+                        st.write(info["prompt"])
+
+                if "instructions" in info:
+                    with st.expander("Instructions", expanded=False):
+                        st.write(info["instructions"])
+
+                if "base_image" in info:
+                    st.write(f"**Base image:** `{info['base_image']}`")
+
+                if "created_at" in info:
+                    st.write(f"**Created at:** {info['created_at']} (UTC)")
+
+                # Optional: show lineage IDs if you want
+                if info.get("parent_id"):
+                    st.write(f"**Parent asset:** `{info['parent_id']}`")
+                if info.get("root_id"):
+                    st.write(f"**Root asset:** `{info['root_id']}`")
+
+                if st.button("Close info"):
+                    st.session_state[info_key] = None
+                    st.rerun()
+
+                st.markdown("---")
+
         st.markdown("#### ℹ️ Image info")
         st.write(f"**File:** `{info_name}`")
 
@@ -1374,72 +1467,108 @@ def _render_gallery(slug: str) -> None:
     meta_changed = False
 
     # ---------- Main layout: gallery (left) + inspector (right) ----------
-    #NEW CODE
     gallery_col, inspector_col = st.columns([5, 2], gap="large")
-
     with gallery_col:
-        cols = st.columns(4)
 
-        for idx, img_path in enumerate(images_sorted):
-            col = cols[idx % 4]
+        def render_grid(image_paths: list[Path]) -> None:
+            cols = st.columns(4)
+            for idx, img_path in enumerate(image_paths):
+                col = cols[idx % 4]
+                with col:
+                    legacy = meta.get(img_path.name, {})
+                    if not isinstance(legacy, dict):
+                        legacy = {}
 
-            with col:
-                info = meta.get(img_path.name, {})
-                caption = _gallery_caption(img_path.name, meta)
-                favorite = bool(info.get("favorite"))
-                selected = bool(info.get("selected"))
+                    info = merged_info(img_path.name)  # enriched
+                    caption = _gallery_caption(img_path.name, meta, info_override=info)
 
-                # ---- Card wrapper ----
-                st.markdown('<div class="image-card">', unsafe_allow_html=True)
-                st.markdown('<div class="image-wrapper">', unsafe_allow_html=True)
+                    favorite = bool(legacy.get("favorite"))
+                    selected = bool(legacy.get("selected"))
 
-                # ---- Image thumbnail ----
-                b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
-                is_active = st.session_state.get("selected_image_name") == img_path.name
-                selected_cls = " selected" if is_active else ""
+                    # ---- Card wrapper ----
+                    st.markdown('<div class="image-card">', unsafe_allow_html=True)
+                    st.markdown('<div class="image-wrapper">', unsafe_allow_html=True)
 
-                st.markdown(
-                    f'''
-                    <div class="caf-thumb-box{selected_cls}">
-                        <img src="data:image/png;base64,{b64}">
-                    </div>
-                    ''',
-                    unsafe_allow_html=True,
-                )
+                    # ---- Image thumbnail ----
+                    b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
+                    is_active = st.session_state.get("selected_image_name") == img_path.name
+                    selected_cls = " selected" if is_active else ""
 
-                st.markdown('</div>', unsafe_allow_html=True)  # close image-wrapper
+                    st.markdown(
+                        f'''
+                        <div class="caf-thumb-box{selected_cls}">
+                            <img src="data:image/png;base64,{b64}">
+                        </div>
+                        ''',
+                        unsafe_allow_html=True,
+                    )
 
-                # ---------- Action Icons ----------
-                lc1, lc2, lc3 = st.columns(3)
+                    st.markdown('</div>', unsafe_allow_html=True)  # close image-wrapper
 
-                with lc1:
-                    if st.button("🔍", key=f"view_{slug}_{img_path.name}"):
-                        st.session_state["selected_image_name"] = img_path.name
-                        st.session_state[preview_key] = str(img_path)
-                        st.rerun()
+                    # ---------- Action Icons ----------
+                    lc1, lc2, lc3 = st.columns(3)
 
-                with lc2:
-                    star_label = "⭐" if favorite else "☆"
-                    if st.button(star_label, key=f"fav_{slug}_{img_path.name}"):
-                        info["favorite"] = not favorite
-                        meta[img_path.name] = info
-                        meta_changed = True
+                    with lc1:
+                        if st.button("🔍", key=f"view_{slug}_{img_path.name}"):
+                            st.session_state["selected_image_name"] = img_path.name
+                            st.session_state[preview_key] = str(img_path)
+                            st.rerun()
 
-                with lc3:
-                    if st.button("ℹ️", key=f"info_{slug}_{img_path.name}"):
-                        st.session_state["selected_image_name"] = img_path.name
-                        st.rerun()
+                    with lc2:
+                        star_label = "⭐" if favorite else "☆"
+                        if st.button(star_label, key=f"fav_{slug}_{img_path.name}"):
+                            legacy["favorite"] = not favorite
+                            meta[img_path.name] = legacy
+                            nonlocal_meta_changed[0] = True
 
-                # ---------- Select Checkbox ----------
-                sel_key = f"sel_{slug}_{img_path.name}"
-                sel_value = st.checkbox("Select", key=sel_key, value=selected)
-                selection_states[img_path.name] = sel_value
+                    with lc3:
+                        if st.button("ℹ️", key=f"info_{slug}_{img_path.name}"):
+                            st.session_state["selected_image_name"] = img_path.name
+                            st.session_state[info_key] = img_path.name
+                            st.rerun()
 
-                # ---- Caption (NEW logic) ----
-                st.caption(caption)
+                    # ---------- Select Checkbox ----------
+                    sel_key = f"sel_{slug}_{img_path.name}"
+                    sel_value = st.checkbox("Select", key=sel_key, value=selected)
+                    selection_states[img_path.name] = sel_value
 
-                st.markdown('</div>', unsafe_allow_html=True)  # close image-card
+                    st.caption(caption)
 
+                    st.markdown('</div>', unsafe_allow_html=True)  # close image-card
+
+        # allow nested function to mark meta_changed
+        nonlocal_meta_changed = [False]
+
+        if group_by_family:
+            families: dict[str, list[Path]] = {}
+            for p in images_sorted:
+                fk = family_key_for(p)
+                families.setdefault(fk, []).append(p)
+
+            for fk, fam_paths in families.items():
+                # Pick a lead for the header: current > origin > first
+                lead = None
+                for p in fam_paths:
+                    if bool(meta.get(p.name, {}).get("is_current")):
+                        lead = p
+                        break
+                if lead is None:
+                    for p in fam_paths:
+                        if merged_info(p.name).get("kind") == "origin":
+                            lead = p
+                            break
+                if lead is None:
+                    lead = fam_paths[0]
+
+                st.markdown(f"#### {_title_from_filename(lead.name)}")
+                render_grid(fam_paths)
+                st.markdown("---")
+        else:
+            render_grid(images_sorted)
+
+        meta_changed = meta_changed or nonlocal_meta_changed[0]
+
+ 
     with inspector_col:
         st.subheader("Inspector")
 
