@@ -1517,12 +1517,14 @@ def _render_gallery(slug: str) -> None:
     object-fit: cover;
     object-position: center center;
 }
-                /* Selected thumbnail highlight */
+
+/* Selected thumbnail highlight */
 .caf-thumb-box.selected {
     outline: 3px solid rgba(59, 130, 246, 0.9);
     outline-offset: 2px;
     box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
 }
+
 .caf-link-row button {
     border: none;
     background: none;
@@ -1530,6 +1532,7 @@ def _render_gallery(slug: str) -> None:
     margin: 0;
     font-size: 0.9rem;
 }
+
 .favorite-badge {
     position: absolute;
     top: 4px;
@@ -1538,13 +1541,40 @@ def _render_gallery(slug: str) -> None:
     padding: 2px 6px;
     border-radius: 6px;
 }
+
 .image-card {
     padding-bottom: 10px;
 }
+
 .image-wrapper {
-    position: relative;
+    position: relative; /* needed for overlays */
+}
+
+/* ---------- NEW: Version/Current label overlay ---------- */
+.caf-thumb-label {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    right: 6px;
+    padding: 4px 8px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    line-height: 1.1;
+    background: rgba(255, 255, 255, 0.88);
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    backdrop-filter: blur(2px);
+    z-index: 2;
+}
+
+.caf-thumb-label .big {
+    font-weight: 700;
+}
+
+.caf-thumb-label.current {
+    border: 1px solid rgba(34, 197, 94, 0.45);
 }
 </style>
+
 """, unsafe_allow_html=True)
     
     selection_states = {}
@@ -1578,14 +1608,34 @@ def _render_gallery(slug: str) -> None:
                     is_active = st.session_state.get("selected_image_name") == img_path.name
                     selected_cls = " selected" if is_active else ""
 
+                    # Build label text from merged info
+                    v = info.get("version")
+                    kind = info.get("kind", "origin")
+                    is_current = info.get("is_current") is True
+
+                    if kind == "origin":
+                        label_text = f"V{v} · Original" if v else "Original"
+                    elif is_current:
+                        label_text = f"V{v} · Current"
+                    else:
+                        label_text = f"V{v} · Variant" if v else "Variant"
+
+                    label_cls = "caf-thumb-label current" if is_current else "caf-thumb-label"
+
                     st.markdown(
                         f'''
-                        <div class="caf-thumb-box{selected_cls}">
-                            <img src="data:image/png;base64,{b64}">
+                        <div class="image-wrapper">
+                            <div class="{label_cls}">
+                                <span class="big">{label_text}</span>
+                            </div>
+                            <div class="caf-thumb-box{selected_cls}">
+                                <img src="data:image/png;base64,{b64}">
+                            </div>
                         </div>
                         ''',
                         unsafe_allow_html=True,
                     )
+
 
                     st.markdown('</div>', unsafe_allow_html=True)  # close image-wrapper
 
