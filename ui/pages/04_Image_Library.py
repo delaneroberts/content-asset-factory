@@ -19,6 +19,8 @@ from caf_app.storage import load_campaign
 from caf_app.models import Campaign  # for type hints / future use
 from caf_app.asset_store import AssetStore
 from caf_app.asset_store import load_assets_index
+from textwrap import dedent
+
 
 ASSET_STORE = AssetStore(campaigns_root=Path("campaigns"))
 
@@ -1550,20 +1552,17 @@ def _render_gallery(slug: str) -> None:
     position: relative; /* needed for overlays */
 }
 
-/* ---------- NEW: Version/Current label overlay ---------- */
+/* Label bar ABOVE the image (replaces overlay bubble) */
 .caf-thumb-label {
-    position: absolute;
-    top: 6px;
-    left: 6px;
-    right: 6px;
+    position: static;              /* <-- critical */
+    margin: 0 auto 6px auto;
+    width: 200px;                  /* match thumb */
     padding: 4px 8px;
     border-radius: 8px;
     font-size: 0.85rem;
     line-height: 1.1;
     background: rgba(255, 255, 255, 0.88);
-    border: 1px solid rgba(0, 0, 0, 0.08);
-    backdrop-filter: blur(2px);
-    z-index: 2;
+    border: 1px solid rgba(0, 0, 0, 0.12);
 }
 
 .caf-thumb-label .big {
@@ -1600,8 +1599,8 @@ def _render_gallery(slug: str) -> None:
                     selected = bool(legacy.get("selected"))
 
                     # ---- Card wrapper ----
-                    st.markdown('<div class="image-card">', unsafe_allow_html=True)
-                    st.markdown('<div class="image-wrapper">', unsafe_allow_html=True)
+                   # st.markdown('<div class="image-card">', unsafe_allow_html=True)
+                   # st.markdown('<div class="image-wrapper">', unsafe_allow_html=True)
 
                     # ---- Image thumbnail ----
                     b64 = base64.b64encode(img_path.read_bytes()).decode("utf-8")
@@ -1622,20 +1621,18 @@ def _render_gallery(slug: str) -> None:
 
                     label_cls = "caf-thumb-label current" if is_current else "caf-thumb-label"
 
-                    st.markdown(
-                        f'''
-                        <div class="image-wrapper">
-                            <div class="{label_cls}">
-                                <span class="big">{label_text}</span>
-                            </div>
-                            <div class="caf-thumb-box{selected_cls}">
-                                <img src="data:image/png;base64,{b64}">
-                            </div>
-                        </div>
-                        ''',
-                        unsafe_allow_html=True,
+                    html = (
+                        f'<div class="caf-thumb-card">'
+                        f'<div class="{label_cls}">'
+                        f'<span class="big">{label_text}</span>'
+                        f'</div>'
+                        f'<div class="caf-thumb-box{selected_cls}">'
+                        f'<img src="data:image/png;base64,{b64}">'
+                        f'</div>'
+                        f'</div>'
                     )
 
+                    st.markdown(html, unsafe_allow_html=True)
 
                     st.markdown('</div>', unsafe_allow_html=True)  # close image-wrapper
 
