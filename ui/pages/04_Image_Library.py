@@ -1458,97 +1458,47 @@ def _render_variant_generation_ui(slug: str) -> None:
         st.rerun()
 
 
+# Only place prompt-based generation is done
 def _render_prompt_generation_ui(slug: str) -> None:
     st.markdown("### 🎨 Generate Images From Prompt")
 
-    with st.expander("Open generator", expanded=False):
-        prompt = st.text_area(
-            "Prompt",
-            placeholder="Describe the image you want to generate…",
-            height=120,
-            key=f"gen_prompt_{slug}",
-        )
+    # -------------------------
+    # GenStudio: Creative Intent (human-friendly)
+    # -------------------------
+    st.markdown("#### Describe what you want")
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            engine = st.selectbox(
-                "Engine",
-                ["stability", "openai", "nanobanana"],
-                index=0,
-                help="Which image engine to use.",
-                key=f"gen_engine_{slug}",
-            )
-        with col2:
-            n_images = st.slider(
-                "Number of images",
-                min_value=1,
-                max_value=6,
-                value=2,
-                key=f"gen_n_{slug}",
-            )
-        with col3:
-            size = st.selectbox(
-                "Size (ignored by some engines)",
-                ["1024x1024", "768x768"],
-                index=0,
-                key=f"gen_size_{slug}",
-            )
+    intent_text = st.text_area(
+        "Write freely — goals, mood, audience, constraints. You can paste briefs, notes, or copy.",
+        value=st.session_state.get("genstudio_intent_text", ""),
+        height=180,
+        key="genstudio_intent_text",
+    )
 
-        if st.button("Generate images", type="primary", key=f"gen_btn_{slug}"):
-            if not prompt.strip():
-                st.warning("Please enter a prompt.")
-                return
-
-            with st.spinner(f"Generating {n_images} image(s) with {engine}…"):
-                try:
-                    # If your engine function uses size, pass it; otherwise ignore.
-                    img_bytes_list = _generate_images_for_engine(engine, prompt.strip(), n_images)
-                except Exception as e:  # noqa: BLE001
-                    st.error(str(e))
-                    return
-            
-                versions = _next_versions_for_root(meta, str(base_root_id), len(img_bytes_list))
-
-                saved_paths: list[Path] = []
-                #for img_bytes in img_bytes_list:
-                for i, img_bytes in enumerate(img_bytes_list):
-                    vnum = versions[i]
-                    # IMPORTANT: engine must be the selected engine (not hard-coded "openai")
-                    for img_bytes in img_bytes_list:
-                        path, asset_id = _save_image_bytes(
-                            slug,
-                            img_bytes,
-                            generated=True,
-                            kind="origin",
-                            engine=engine,
-                            prompt=prompt.strip(),
-                        )
-                    saved_paths.append(path)
-
-
-                    # No second metadata write here.
-                    # _save_image_bytes already:
-                    # - upserts AssetStore
-                    # - writes legacy metadata including asset_id/family_id
-
-            st.success(f"Saved {len(saved_paths)} image(s) to this campaign.")
-            st.rerun()
-
-
-#Only place variants are generated
-def _render_prompt_generation_ui(slug: str) -> None:
-    st.markdown("### 🎨 Generate Images From Prompt")
+    # MVP bridge: until Step 3/4 lands, generation uses this text
+    prompt_text = (intent_text or "").strip()
 
     with st.expander("Open generator", expanded=False):
-        prompt = st.text_area(
-            "Prompt",
-            placeholder="Describe the image you want to generate…",
-            height=120,
-            key=f"gen_prompt_{slug}",
+
+        # -------------------------
+        # GenStudio: Prompt refinement toggle (default ON)
+        # -------------------------
+        refine_enabled = st.checkbox(
+            "Refine prompt for best results",
+            value=st.session_state.get("genstudio_refine_enabled", True),
+            key="genstudio_refine_enabled",
         )
 
-        col1, col2, col3 = st.columns(3)
+        # TEMP override (optional) — IMPORTANT: use a new key (avoid collisions)
+        override = st.text_area(
+            "Legacy prompt (temporary override)",
+            placeholder="Optional: override the intent text for generation…",
+            height=120,
+            key=f"gen_override_{slug}",  # <-- NOT gen_prompt_{slug}
+        )
+        if override.strip():
+            prompt_text = override.strip()
 
+        col1, col2, col3 = st.columns(3)
         with col1:
             engine = st.selectbox(
                 "Engine",
@@ -1601,7 +1551,7 @@ def _render_prompt_generation_ui(slug: str) -> None:
                             generated=True,
                             kind="origin",
                             engine=engine,
-                            prompt=prompt.strip(),
+                            prompt_text=prompt.strip(),
                         )
                         saved_paths.append(path)
                     except Exception as e:  # noqa: BLE001
