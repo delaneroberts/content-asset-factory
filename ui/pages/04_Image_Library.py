@@ -1,6 +1,5 @@
 # ui/pages/04_Image_Library.py
 from __future__ import annotations
-
 import base64
 import os
 import time
@@ -12,6 +11,7 @@ import json
 import zipfile
 import requests
 import streamlit as st
+import uuid
 from openai import OpenAI, OpenAIError
 from huggingface_hub import InferenceClient
 from PIL import Image
@@ -20,6 +20,11 @@ from caf_app.models import Campaign  # for type hints / future use
 from caf_app.asset_store import AssetStore
 from caf_app.asset_store import load_assets_index
 from textwrap import dedent
+from typing import Dict, List, Any, List, Tuple, Optional
+from openai import OpenAI
+from typing import Dict, List
+from pathlib import Path
+
 
 
 ASSET_STORE = AssetStore(campaigns_root=Path("campaigns"))
@@ -205,6 +210,88 @@ def _apply_supersede(meta: dict, new_filename: str) -> dict:
     meta[new_filename] = new_info
 
     return meta
+
+# ---------------------------------------------------------------------------
+# multiref + image generation helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_campaign_image_path(slug: str, filename: str) -> Optional[Path]:
+    img_dir = Path("campaigns") / slug / "images"
+    # add/remove folders to match your CAF
+    for sub in ["generated", "uploaded", "external", "variants", "references"]:
+        p = img_dir / sub / filename
+        if p.exists():
+            return p
+    p = img_dir / filename
+    return p if p.exists() else None
+
+
+def _campaign_dir(slug: str) -> Path:
+    return Path("campaigns") / slug
+
+def _images_dir(slug: str) -> Path:
+    return _campaign_dir(slug) / "images"
+
+def _refs_dir(slug: str) -> Path:
+    # Keep multiref uploads separate so you can distinguish them from “real” library images later.
+    return _images_dir(slug) / "references"
+
+def _generated_dir(slug: str) -> Path:
+    return _images_dir(slug) / "generated"
+
+def _meta_path(slug: str) -> Path:
+    # Adjust if you already have a different metadata filename
+    return _images_dir(slug) / "images_meta.json"
+
+def _load_meta(slug: str) -> Dict[str, Any]:
+    p = _meta_path(slug)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_meta(slug: str, meta: Dict[str, Any]) -> None:
+    p = _meta_path(slug)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def _safe_ext(filename: str) -> str:
+    ext = (Path(filename).suffix or "").lower()
+    return ext if ext in [".png", ".jpg", ".jpeg", ".webp"] else ".png"
+
+def _save_uploaded_file(slug: str, uploaded, subdir: Path) -> str:
+    subdir.mkdir(parents=True, exist_ok=True)
+    out_name = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}{_safe_ext(uploaded.name)}"
+    out_path = subdir / out_name
+    out_path.write_bytes(uploaded.getbuffer())
+    return out_name
+
+def _build_multiref_prompt(user_prompt: str, roles: Dict[str, str], primary_name: str) -> str:
+    # Keep it simple + explicit (MVP)
+    role_lines = []
+    for fname, role in roles.items():
+        if fname == primary_name:
+            continue
+        if role and role != "(none)":
+            role_lines.append(f"- Use {fname} as a {role} reference (do not copy identity).")
+
+    role_block = "\n".join(role_lines) if role_lines else "- Other images are general style references only."
+
+    return (
+        "You are generating a NEW image.\n"
+        f"Primary identity image: {primary_name} (preserve facial identity, proportions, age).\n"
+        "Do NOT change gender/age/ethnicity.\n"
+        "Supporting references:\n"
+        f"{role_block}\n\n"
+        "User request:\n"
+        f"{user_prompt.strip()}\n\n"
+        "Output requirements:\n"
+        "- Photorealistic\n"
+        "- Clean, professional look\n"
+        "- No text, logos, watermarks\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -827,9 +914,11 @@ def _render_tools_panel(slug: str) -> None:
                 "Upload external images",
                 "Generate from prompt",
                 "Variants from base",
+                "Multi-reference",
                 "Export images",
             ]
         )
+
 
         with tabs[0]:
             _render_upload_section(slug)
@@ -841,7 +930,338 @@ def _render_tools_panel(slug: str) -> None:
             _render_variant_generation_ui(slug)
 
         with tabs[3]:
+            _render_multiref_generation_ui(slug)
+
+        with tabs[4]:
             _render_export_section(slug)
+
+def _render_multiref_generation_ui(slug: str) -> None:
+    st.markdown("### Create from multiple references")
+    st.caption(
+        "Use either (A) images you selected in the gallery, or (B) upload 2–6 reference images here."
+    )
+
+    # ----------------------------
+    # A) Use selected images (from gallery)
+    # ----------------------------
+    selected: List[str] = st.session_state.get("selected_images", []) or []
+
+    colA, colB = st.columns([1, 2])
+    with colA:
+        use_selected = st.button(
+            "Use selected images",
+            key=f"multiref_use_selected_{slug}",
+            disabled=len(selected) < 2,
+            help="Select at least 2 images in the gallery first.",
+        )
+    with colB:
+        if selected:
+            st.caption(f"Gallery selected: {len(selected)} image(s)")
+
+    if use_selected:
+        st.session_state[f"multiref_from_gallery_{slug}"] = {
+            "primary": selected[0],
+            "supporting": selected[1:6],  # cap total refs to 6
+        }
+        st.success("Loaded selections from gallery.")
+
+    gallery_pick = st.session_state.get(f"multiref_from_gallery_{slug}")
+
+    if gallery_pick:
+        picked = [gallery_pick["primary"]] + list(gallery_pick.get("supporting", []))
+
+        st.markdown("#### Gallery references")
+        primary_name = st.selectbox(
+            "Primary identity (required)",
+            options=picked,
+            index=0,
+            key=f"multiref_gallery_primary_{slug}",
+        )
+
+        role_options = ["(none)", "pose", "lighting", "wardrobe", "mood"]
+        roles: Dict[str, str] = {primary_name: "primary"}
+
+        st.markdown("#### Optional: tag supporting references")
+        for n in picked:
+            if n == primary_name:
+                continue
+            roles[n] = st.selectbox(
+                f"Role for `{n}`",
+                options=role_options,
+                index=0,
+                key=f"multiref_gallery_role_{slug}_{n}",
+            )
+
+        # Persist back into the gallery_pick state (so Generate uses your choices)
+        st.session_state[f"multiref_from_gallery_{slug}"] = {
+            "primary": primary_name,
+            "supporting": [n for n in picked if n != primary_name],
+            "roles": roles,
+        }
+
+        st.info(
+            f"Using gallery selections — Primary: `{primary_name}` "
+            f"| Supporting: {len([n for n in picked if n != primary_name])}"
+        )
+
+
+    # ----------------------------
+    # B) Upload reference images
+    # ----------------------------
+    uploads = st.file_uploader(
+        "Upload reference images (2–6) — optional if you’re using gallery selections",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        key=f"multiref_uploads_{slug}",
+    )
+
+    # Must have either gallery refs OR >=2 uploads
+    if (not uploads or len(uploads) < 2) and not gallery_pick:
+        st.info("Select at least 2 images in the gallery OR upload at least 2 images here.")
+        return
+
+    # Cap uploads (only if uploads provided)
+    if uploads and len(uploads) > 6:
+        st.warning("Please limit to 6 uploaded images for now (MVP).")
+        uploads = uploads[:6]
+
+    use_gallery = bool(gallery_pick)
+    use_uploads = bool(uploads) and len(uploads) >= 2
+
+    if use_gallery and use_uploads:
+        st.warning(
+            "Both gallery selections and uploads are present. "
+            "MVP behavior: using gallery selections and ignoring uploads."
+        )
+
+    # ----------------------------
+    # If gallery mode: stop here for now (prevents half-wired behavior)
+    # ----------------------------
+    if use_gallery:
+        prompt = st.text_area(
+            "What should we generate?",
+            value="Professional headshot, neutral background, natural light, realistic.",
+            height=90,
+            key=f"multiref_prompt_gallery_{slug}",
+        ).strip()
+
+        do_generate = st.button(
+            "Generate",
+            key=f"multiref_generate_gallery_{slug}",
+            disabled=not prompt,
+        )
+
+        if not do_generate:
+            return
+
+        try:
+            _generated_dir(slug).mkdir(parents=True, exist_ok=True)
+
+            primary_name = gallery_pick["primary"]
+            supporting_names = gallery_pick.get("supporting", [])
+
+            # Resolve primary image path
+            primary_path = _resolve_campaign_image_path(slug, primary_name)
+            if not primary_path:
+                st.error(f"Could not find primary image on disk: {primary_name}")
+                return
+
+            # Resolve supporting image paths
+            supporting_ok = []
+            supporting_paths = []
+            for name in supporting_names:
+                p = _resolve_campaign_image_path(slug, name)
+                if not p:
+                    st.warning(f"Skipping missing supporting image: {name}")
+                    continue
+                supporting_ok.append(name)
+                supporting_paths.append(p)
+
+
+            if not supporting_paths:
+                st.error("Need at least one supporting image in addition to the primary.")
+                return
+
+            # Minimal roles for gallery MVP
+            roles = {primary_name: "primary"}
+            for n in supporting_names:
+                roles[n] = "(none)"
+
+            full_prompt = _build_multiref_prompt(
+                prompt,
+                roles,
+                primary_name=primary_name,
+            )
+
+            client = OpenAI()
+
+            img_paths = [primary_path] + supporting_paths
+            files = [p.open("rb") for p in img_paths]
+            try:
+                result = client.images.edit(
+                    model="gpt-image-1",
+                    image=files,
+                    prompt=full_prompt,
+                    input_fidelity="high",
+                    size="1024x1024",
+                    output_format="png",
+                )
+            finally:
+                for f in files:
+                    try:
+                        f.close()
+                    except Exception:
+                        pass
+
+            img_bytes = base64.b64decode(result.data[0].b64_json)
+
+            out_name = f"{int(time.time() * 1000)}_multiref.png"
+            out_path = _generated_dir(slug) / out_name
+            out_path.write_bytes(img_bytes)
+
+            meta = _load_meta(slug)
+            meta[out_name] = {
+                "kind": "generated",
+                "engine": "openai",
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "prompt": prompt,
+                "instructions": full_prompt,
+                "base_image": primary_name,
+                "reference_images": (
+                    [{"file": primary_name, "role": "primary"}]
+                    + [{"file": n, "role": "(none)"} for n in supporting_names]
+                ),
+                "derivation": {"type": "multi_reference_guided", "source": "library"},
+                "spec": {"size": "1024x1024", "output_format": "png", "input_fidelity": "high"},
+            }
+            _save_meta(slug, meta)
+
+            st.success(f"Created: {out_name}")
+            st.image(str(out_path), use_container_width=True)
+
+        except Exception as e:
+            st.error(f"Multi-reference (gallery) generation failed: {e}")
+
+        return
+
+
+
+        # ----------------------------
+        # Upload mode UI (names + primary + roles)
+        # ----------------------------
+        # At this point, uploads must exist and have len >= 2
+        names = [u.name for u in uploads]
+
+        primary = st.selectbox(
+            "Primary identity (required)",
+            options=names,
+            index=0,
+            key=f"multiref_primary_upload_{slug}",
+            help="This image’s identity should be preserved.",
+        )
+
+        role_options = ["(none)", "pose", "lighting", "wardrobe", "mood"]
+        st.markdown("#### Optional: tag supporting references")
+        roles: Dict[str, str] = {}
+
+        for n in names:
+            if n == primary:
+                roles[n] = "primary"
+                continue
+            roles[n] = st.selectbox(
+                f"Role for `{n}`",
+                options=role_options,
+                index=0,
+                key=f"multiref_role_upload_{slug}_{n}",
+            )
+
+        prompt = st.text_area(
+            "What should we generate?",
+            value="Professional headshot, neutral background, natural light, realistic.",
+            height=90,
+            key=f"multiref_prompt_upload_{slug}",
+        ).strip()
+
+        with st.expander("Review selection", expanded=False):
+            st.write("**Primary:**", primary)
+            st.write("**Roles:**", roles)
+            st.write("**Prompt:**", prompt)
+
+        do_generate = st.button(
+            "Generate",
+            key=f"multiref_generate_upload_{slug}",
+            disabled=not prompt,
+        )
+        if not do_generate:
+            return
+
+    # ----------------------------
+    # Upload-mode Generate handler (your existing working logic)
+    # ----------------------------
+    try:
+        _refs_dir(slug).mkdir(parents=True, exist_ok=True)
+        _generated_dir(slug).mkdir(parents=True, exist_ok=True)
+
+        # Save uploaded refs into campaigns/<slug>/images/references/
+        saved_map: Dict[str, str] = {}
+        for u in uploads:
+            saved_map[u.name] = _save_uploaded_file(slug, u, _refs_dir(slug))
+
+        primary_saved = saved_map[primary]
+
+        full_prompt = _build_multiref_prompt(prompt, roles, primary_name=primary)
+
+        client = OpenAI()  # expects OPENAI_API_KEY in env
+
+        # Primary first, then others
+        img_paths: List[Path] = [(_refs_dir(slug) / primary_saved)]
+        for orig_name in names:
+            if orig_name == primary:
+                continue
+            img_paths.append(_refs_dir(slug) / saved_map[orig_name])
+
+        files = [p.open("rb") for p in img_paths]
+        try:
+            result = client.images.edit(
+                model="gpt-image-1",
+                image=files,
+                prompt=full_prompt,
+                input_fidelity="high",
+                size="1024x1024",
+                output_format="png",
+            )
+        finally:
+            for f in files:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+
+        img_bytes = base64.b64decode(result.data[0].b64_json)
+
+        out_name = f"{int(time.time() * 1000)}_multiref.png"
+        out_path = _generated_dir(slug) / out_name
+        out_path.write_bytes(img_bytes)
+
+        meta = _load_meta(slug)
+        meta[out_name] = {
+            "kind": "generated",
+            "engine": "openai",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "prompt": prompt,
+            "instructions": full_prompt,
+            "base_image": primary_saved,
+            "reference_images": [{"file": saved_map[n], "role": roles.get(n, "(none)")} for n in names],
+            "derivation": {"type": "multi_reference_guided"},
+            "spec": {"size": "1024x1024", "output_format": "png", "input_fidelity": "high"},
+        }
+        _save_meta(slug, meta)
+
+        st.success(f"Created: {out_name}")
+        st.image(str(out_path), use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Multi-reference generation failed: {e}")
 
 
 def _render_campaign_header(slug: str) -> None:
@@ -885,9 +1305,6 @@ def _render_campaign_header(slug: str) -> None:
                 brief = data[key]
                 break
 
-    if brief:
-        with st.expander("View campaign brief", expanded=False):
-            st.write(brief)
 
 
 def _render_upload_section(slug: str) -> None:
@@ -1292,7 +1709,8 @@ def _title_from_filename(filename: str) -> str:
 
 def _render_gallery(slug: str) -> None:
     st.markdown("### 🖼️ Campaign Image Library")
-
+    if "selected_images" not in st.session_state:
+        st.session_state["selected_images"] = []
     all_images = _list_all_images(slug)
     meta = _load_image_metadata(slug)
     meta, ensured = _ensure_image_metadata_schema(meta)
@@ -1421,42 +1839,45 @@ def _render_gallery(slug: str) -> None:
             st.rerun()
         st.markdown("---")
 
-        if info_name:
-            info = merged_info(info_name)
-            if info:
-                st.markdown("#### ℹ️ Image info")
-                st.write(f"**File:** `{info_name}`")
+        info = merged_info(info_name) if info_name else {}
 
-                if "kind" in info:
-                    st.write(f"**Kind:** {info['kind']}")
-                if "engine" in info:
-                    st.write(f"**Engine:** {info['engine']}")
+        if info_name and info:
+            st.markdown("#### ℹ️ Image info")
+            st.write(f"**File:** `{info_name}`")
 
-                if "prompt" in info:
-                    with st.expander("Prompt", expanded=False):
-                        st.write(info["prompt"])
+            if "kind" in info:
+                st.write(f"**Kind:** {info['kind']}")
+            if "engine" in info:
+                st.write(f"**Engine:** {info['engine']}")
 
-                if "instructions" in info:
-                    with st.expander("Instructions", expanded=False):
-                        st.write(info["instructions"])
+            if "prompt" in info:
+                with st.expander("Prompt", expanded=False):
+                    st.write(info["prompt"])
 
-                if "base_image" in info:
-                    st.write(f"**Base image:** `{info['base_image']}`")
+            if "instructions" in info:
+                with st.expander("Instructions", expanded=False):
+                    st.write(info["instructions"])
 
-                if "created_at" in info:
-                    st.write(f"**Created at:** {info['created_at']} (UTC)")
+            if "base_image" in info:
+                st.write(f"**Base image:** `{info['base_image']}`")
 
-                # Optional: show lineage IDs if you want
-                if info.get("parent_id"):
-                    st.write(f"**Parent asset:** `{info['parent_id']}`")
-                if info.get("root_id"):
-                    st.write(f"**Root asset:** `{info['root_id']}`")
+            if "original_filename" in info:
+                st.write(f"**Original filename:** `{info['original_filename']}`")
 
-                if st.button("Close info"):
-                    st.session_state[info_key] = None
-                    st.rerun()
+            if "created_at" in info:
+                st.write(f"**Created at:** {info['created_at']} (UTC)")
 
-                st.markdown("---")
+            if info.get("parent_id"):
+                st.write(f"**Parent asset:** `{info['parent_id']}`")
+            if info.get("root_id"):
+                st.write(f"**Root asset:** `{info['root_id']}`")
+
+            if st.button("Close info"):
+                st.session_state[info_key] = None
+                st.rerun()
+
+            st.markdown("---")
+
 
         st.markdown("#### ℹ️ Image info")
         st.write(f"**File:** `{info_name}`")
@@ -1483,9 +1904,10 @@ def _render_gallery(slug: str) -> None:
         if "created_at" in info:
             st.write(f"**Created at:** {info['created_at']} (UTC)")
 
-        if st.button("Close info"):
-            st.session_state[info_key] = None
+        if st.button("Close info", key=f"close_info_{slug}_{st.session_state.get('selected_image_name','none')}"):
+            st.session_state["selected_image_name"] = None
             st.rerun()
+
 
         st.markdown("---")
 
@@ -1701,6 +2123,7 @@ def _render_gallery(slug: str) -> None:
             render_grid(images_sorted)
 
         meta_changed = meta_changed or nonlocal_meta_changed[0]
+        st.session_state["selected_images"] = [fn for fn, sel in selection_states.items() if sel]
 
  
     with inspector_col:
@@ -1946,6 +2369,10 @@ def _render_gallery(slug: str) -> None:
             info["selected"] = False
             meta_changed = True
         meta[filename] = info
+    st.session_state["selected_images"] = [
+        fn for fn, inf in meta.items()
+        if isinstance(inf, dict) and inf.get("selected") is True
+]
 
     # ---------- Bulk Delete ----------
     if st.button("Delete selected images"):
