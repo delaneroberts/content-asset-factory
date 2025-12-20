@@ -1,5 +1,6 @@
 # ui/pages/04_Image_Library.py
 from __future__ import annotations
+from caf_app.services.prompt_refiner import refine_prompt
 import base64
 import os
 import time
@@ -1457,9 +1458,6 @@ def _render_variant_generation_ui(slug: str) -> None:
         st.success("Variants created.")
         st.rerun()
 
-from pathlib import Path
-import streamlit as st
-
 # Only place prompt-based generation is done
 def _render_prompt_generation_ui(slug: str) -> None:
     st.markdown("### 🎨 Generate Images From Prompt")
@@ -1501,7 +1499,30 @@ def _render_prompt_generation_ui(slug: str) -> None:
         # -------------------------
         # For now, refinement is a placeholder hook; we still use intent_text/override directly.
         # In Step 2, this becomes: refined_prompt = refine_prompt(intent_text, ...)
-        used_prompt = override if override else intent_text
+
+        # -------------------------
+        # GenStudio: Prompt refinement (Step 2)
+        # -------------------------
+
+        override_clean = (override or "").strip()
+        used_prompt = override_clean if override_clean else (intent_text or "").strip()
+
+        refined_prompt = used_prompt
+        refinement = None
+
+        if refine_enabled and (not override_clean) and used_prompt:
+            try:
+                client = OpenAI()
+                refinement = refine_prompt(used_prompt, client=client)
+                if refinement.refined_prompt:
+                    refined_prompt = refinement.refined_prompt.strip()
+            except Exception as e:  # noqa: BLE001
+                st.warning(f"Prompt refinement failed; using original text. ({e})")
+                refined_prompt = used_prompt
+                refinement = None
+
+        st.caption(f"Refine={refine_enabled} | Override_set={bool(override_clean)} | changed={refined_prompt != used_prompt}")
+
 
         # -------------------------
         # Controls
@@ -1537,13 +1558,17 @@ def _render_prompt_generation_ui(slug: str) -> None:
         # Preview what will be sent
         # -------------------------
         with st.expander("Preview text to be generated", expanded=False):
-            st.write(
-                "This is the text that will be sent to the image engine. "
-                "When refinement is implemented, this will show the refined prompt."
-            )
-            st.code(used_prompt or "(empty)", language="text")
-            if refine_enabled:
-                st.caption("Refinement is enabled, but the refiner step will be wired in next.")
+
+            st.write("This is the text that will be sent to the image engine.")
+
+            if refinement and refined_prompt and refined_prompt != used_prompt:
+                st.caption("Refined prompt (used for generation):")
+                st.code(refined_prompt, language="text")
+                st.caption("Original intent:")
+                st.code(used_prompt, language="text")
+            else:
+                st.caption("Prompt (used for generation):")
+                st.code(refined_prompt or "(empty)", language="text")
 
         # -------------------------
         # Action
@@ -1557,7 +1582,8 @@ def _render_prompt_generation_ui(slug: str) -> None:
                 try:
                     # If your engine supports size, wire it there.
                     # For now your helper ignores size, so we do too.
-                    img_bytes_list = _generate_images_for_engine(engine, used_prompt, n_images)  # noqa: F821
+                    img_bytes_list = _generate_images_for_engine(engine, refined_prompt, n_images)
+
                 except Exception as e:  # noqa: BLE001
                     st.error(str(e))
                     return
@@ -1575,156 +1601,7 @@ def _render_prompt_generation_ui(slug: str) -> None:
                             kind="origin",
                             engine=engine,
                             # Store what was actually used for generation.
-                            prompt_text=used_prompt,
-                            # Prep for Step 4: store the original intent too (even if override used).
-                            # If your _save_image_bytes doesn't accept these yet, add them in Step 4.
-                            input_text=intent_text,
-                            refine_enabled=refine_enabled,
-                            size=size,
-                        )
-                        saved_paths.append(path)
-                    except TypeError:
-                        # Backward-compat: if _save_image_bytes doesn't accept the new kwargs yet
-                        path, asset_id = _save_image_bytes(  # noqa: F821
-                            slug,
-                            img_bytes,
-                            generated=True,
-                            kind="origin",
-                            engine=engine,
-                            prompt_text=used_prompt,
-                        )
-                        saved_paths.append(path)
-                    except Exception as e:  # noqa: BLE001
-                        failed.append(f"Image {idx}: {e}")
-
-            if saved_paths:
-                st.success(f"Saved {len(saved_paths)} image(s) to this campaign.")
-            if failed:
-                st.warning("Some images failed to save:")
-                for msg in failed[:8]:
-                    st.write(f"• {msg}")
-                if len(failed) > 8:
-                    st.write(f"• ...and {len(failed) - 8} more")
-
-            st.rerun()
-
-
-# Only place prompt-based generation is done
-def _render_prompt_generation_ui(slug: str) -> None:
-    st.markdown("### 🎨 Generate Images From Prompt")
-
-    # -------------------------
-    # GenStudio: Creative Intent (human-friendly)
-    # -------------------------
-    st.markdown("#### Describe what you want")
-
-    intent_text = st.text_area(
-        "Write freely — goals, mood, audience, constraints. You can paste briefs, notes, or copy.",
-        value=st.session_state.get("genstudio_intent_text", ""),
-        height=180,
-        key="genstudio_intent_text",
-    ).strip()
-
-    with st.expander("Open generator", expanded=False):
-
-        # -------------------------
-        # GenStudio: Prompt refinement toggle (default ON)
-        # -------------------------
-        refine_enabled = st.checkbox(
-            "Refine prompt for best results",
-            value=st.session_state.get("genstudio_refine_enabled", True),
-            key="genstudio_refine_enabled",
-            help="When enabled, your free-form intent will be refined into a high-quality generation prompt (Step 2).",
-        )
-
-        # TEMP override (optional) — IMPORTANT: use a new key (avoid collisions)
-        override = st.text_area(
-            "Legacy prompt (temporary override)",
-            placeholder="Optional: override the intent text for generation…",
-            height=120,
-            key=f"gen_override_{slug}",
-        ).strip()
-
-        # -------------------------
-        # Determine the text we will use for generation
-        # -------------------------
-        # For now, refinement is a placeholder hook; we still use intent_text/override directly.
-        # In Step 2, this becomes: refined_prompt = refine_prompt(intent_text, ...)
-        used_prompt = override if override else intent_text
-
-        # -------------------------
-        # Controls
-        # -------------------------
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            engine = st.selectbox(
-                "Engine",
-                ["stability", "openai", "nanobanana"],
-                index=0,
-                help="Which image engine to use.",
-                key=f"gen_engine_{slug}",
-            )
-
-        with col2:
-            n_images = st.slider(
-                "Number of images",
-                min_value=1,
-                max_value=6,
-                value=2,
-                key=f"gen_n_{slug}",
-            )
-
-        with col3:
-            size = st.selectbox(
-                "Size (ignored by some engines)",
-                ["1024x1024", "768x768"],
-                index=0,
-                key=f"gen_size_{slug}",
-            )
-
-        # -------------------------
-        # Preview what will be sent
-        # -------------------------
-        with st.expander("Preview text to be generated", expanded=False):
-            st.write(
-                "This is the text that will be sent to the image engine. "
-                "When refinement is implemented, this will show the refined prompt."
-            )
-            st.code(used_prompt or "(empty)", language="text")
-            if refine_enabled:
-                st.caption("Refinement is enabled, but the refiner step will be wired in next.")
-
-        # -------------------------
-        # Action
-        # -------------------------
-        if st.button("Generate images", type="primary", key=f"gen_btn_{slug}"):
-            if not used_prompt:
-                st.warning("Please enter your description (or provide an override).")
-                return
-
-            with st.spinner(f"Generating {n_images} image(s) with {engine}…"):
-                try:
-                    # If your engine supports size, wire it there.
-                    # For now your helper ignores size, so we do too.
-                    img_bytes_list = _generate_images_for_engine(engine, used_prompt, n_images)  # noqa: F821
-                except Exception as e:  # noqa: BLE001
-                    st.error(str(e))
-                    return
-
-                saved_paths: list[Path] = []
-                failed: list[str] = []
-
-                for idx, img_bytes in enumerate(img_bytes_list, start=1):
-                    try:
-                        # Origin images start NEW families (versioning handled in _save_image_bytes/_update_image_metadata_entry)
-                        path, asset_id = _save_image_bytes(  # noqa: F821
-                            slug,
-                            img_bytes,
-                            generated=True,
-                            kind="origin",
-                            engine=engine,
-                            # Store what was actually used for generation.
-                            prompt_text=used_prompt,
+                            prompt_text=refined_prompt,
                             # Prep for Step 4: store the original intent too (even if override used).
                             # If your _save_image_bytes doesn't accept these yet, add them in Step 4.
                             input_text=intent_text,
