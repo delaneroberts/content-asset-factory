@@ -6,6 +6,115 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+import re
+import uuid
+
+def attach_prompt_to_image_meta(
+    meta: dict,
+    filename: str,
+    *,
+    prompt_id: str,
+    prompt_source: str,
+    parent_prompt_id: str | None = None,
+) -> None:
+    """
+    Mutates `meta` in-place: attaches prompt linkage fields to a single image record.
+    Assumes meta[filename] is the per-image metadata dict.
+    """
+    if filename not in meta or not isinstance(meta[filename], dict):
+        meta[filename] = {}
+
+    meta[filename]["prompt_id"] = prompt_id
+    meta[filename]["prompt_source"] = prompt_source
+    meta[filename]["parent_prompt_id"] = parent_prompt_id
+
+def normalize_prompt(text: str) -> str:
+    """
+    Normalize prompt text for deduplication.
+    MVP rules:
+    - strip leading/trailing whitespace
+    - collapse internal whitespace
+    """
+    if not text:
+        return ""
+
+    text = text.strip()
+    # collapse all whitespace to single spaces
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+def find_prompt_by_text(
+    prompts_index: dict,
+    prompt_text: str,
+) -> dict | None:
+    """
+    Return existing prompt record whose normalized prompt_text matches.
+    """
+    target = normalize_prompt(prompt_text)
+    if not target:
+        return None
+
+    for record in prompts_index.get("prompts", {}).values():
+        if normalize_prompt(record.get("prompt_text", "")) == target:
+            return record
+
+    return None
+
+def upsert_prompt_record(
+    slug: str,
+    *,
+    prompt_text: str,
+    input_text: str | None = None,
+    source: str = "manual",   # manual | reuse | refine | imported
+    parent_prompt_id: str | None = None,
+) -> str:
+    """
+    Create or reuse a prompt record in the campaign-local prompt index.
+
+    Returns:
+        prompt_id (str)
+    """
+    data = load_prompts_index(slug)
+    prompts = data["prompts"]
+
+    normalized = normalize_prompt(prompt_text)
+    if not normalized:
+        raise ValueError("prompt_text cannot be empty")
+
+    # ---- Deduplication ----
+    existing = find_prompt_by_text(data, normalized)
+
+    now = _utc_now_iso()
+
+    if existing:
+        # Reuse existing prompt
+        existing["usage_count"] = int(existing.get("usage_count", 0)) + 1
+        existing["last_used_at"] = now
+        existing["updated_at"] = now
+
+        save_prompts_index(slug, data)
+        return existing["prompt_id"]
+
+    # ---- Create new prompt record ----
+    prompt_id = str(uuid.uuid4())
+
+    record = {
+        "prompt_id": prompt_id,
+        "created_at": now,
+        "updated_at": now,
+        "prompt_text": normalized,
+        "input_text": input_text,
+        "source": source,
+        "parent_prompt_id": parent_prompt_id,
+        "usage_count": 1,
+        "last_used_at": now,
+        "favorite": False,
+    }
+
+    prompts[prompt_id] = record
+    save_prompts_index(slug, data)
+
+    return prompt_id
 
 
 # ---- Adjust this if your project uses a different campaigns root ----

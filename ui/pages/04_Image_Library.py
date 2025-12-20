@@ -25,6 +25,9 @@ from typing import Dict, List, Any, List, Tuple, Optional
 from openai import OpenAI
 from typing import Dict, List
 from pathlib import Path
+from caf_app.prompt_store import upsert_prompt_record
+
+
 
 
 
@@ -1459,6 +1462,31 @@ def _render_variant_generation_ui(slug: str) -> None:
         st.rerun()
 
 # Only place prompt-based generation is done
+
+def _attach_prompt_to_image_metadata(
+    slug: str,
+    filename: str,
+    *,
+    prompt_id: str,
+    prompt_source: str,
+    parent_prompt_id: str | None = None,
+) -> None:
+    """
+    Minimal MVP: attach prompt linkage fields to the per-image metadata record.
+    """
+    meta = _load_image_metadata(slug)
+    if filename not in meta or not isinstance(meta[filename], dict):
+        meta[filename] = {}
+
+    meta[filename]["prompt_id"] = prompt_id
+    meta[filename]["prompt_source"] = prompt_source
+    meta[filename]["parent_prompt_id"] = parent_prompt_id
+
+    # NOTE: If your project uses a different save function name, replace this call.
+    _save_image_metadata(slug, meta)
+
+
+# Only place prompt-based generation is done
 def _render_prompt_generation_ui(slug: str) -> None:
     st.markdown("### 🎨 Generate Images From Prompt")
 
@@ -1467,11 +1495,14 @@ def _render_prompt_generation_ui(slug: str) -> None:
     # -------------------------
     st.markdown("#### Describe what you want")
 
-    intent_text = st.text_area(
-        "Write freely — goals, mood, audience, constraints. You can paste briefs, notes, or copy.",
-        value=st.session_state.get("genstudio_intent_text", ""),
-        height=180,
-        key="genstudio_intent_text",
+    intent_text = (
+        st.text_area(
+            "Write freely — goals, mood, audience, constraints. You can paste briefs, notes, or copy.",
+            value=st.session_state.get("genstudio_intent_text", ""),
+            height=180,
+            key="genstudio_intent_text",
+        )
+        or ""
     ).strip()
 
     with st.expander("Open generator", expanded=False):
@@ -1487,23 +1518,19 @@ def _render_prompt_generation_ui(slug: str) -> None:
         )
 
         # TEMP override (optional) — IMPORTANT: use a new key (avoid collisions)
-        override = st.text_area(
-            "Legacy prompt (temporary override)",
-            placeholder="Optional: override the intent text for generation…",
-            height=120,
-            key=f"gen_override_{slug}",
+        override = (
+            st.text_area(
+                "Legacy prompt (temporary override)",
+                placeholder="Optional: override the intent text for generation…",
+                height=120,
+                key=f"gen_override_{slug}",
+            )
+            or ""
         ).strip()
 
         # -------------------------
         # Determine the text we will use for generation
         # -------------------------
-        # For now, refinement is a placeholder hook; we still use intent_text/override directly.
-        # In Step 2, this becomes: refined_prompt = refine_prompt(intent_text, ...)
-
-        # -------------------------
-        # GenStudio: Prompt refinement (Step 2)
-        # -------------------------
-
         override_clean = (override or "").strip()
         used_prompt = override_clean if override_clean else (intent_text or "").strip()
 
@@ -1521,8 +1548,9 @@ def _render_prompt_generation_ui(slug: str) -> None:
                 refined_prompt = used_prompt
                 refinement = None
 
-        st.caption(f"Refine={refine_enabled} | Override_set={bool(override_clean)} | changed={refined_prompt != used_prompt}")
-
+        st.caption(
+            f"Refine={refine_enabled} | Override_set={bool(override_clean)} | changed={refined_prompt != used_prompt}"
+        )
 
         # -------------------------
         # Controls
@@ -1574,16 +1602,36 @@ def _render_prompt_generation_ui(slug: str) -> None:
         # Action
         # -------------------------
         if st.button("Generate images", type="primary", key=f"gen_btn_{slug}"):
+
             if not used_prompt:
                 st.warning("Please enter your description (or provide an override).")
                 return
 
+            # =========================================================
+            # ✅ Step 2 hook: upsert prompt record ONCE per click
+            # =========================================================
+            prompt_source = (
+                "refine"
+                if (refine_enabled and refined_prompt and refined_prompt != used_prompt)
+                else "manual"
+            )
+
+            prompt_id = upsert_prompt_record(
+                slug,
+                prompt_text=refined_prompt,  # what we actually send to engine
+                input_text=intent_text,      # what user typed
+                source=prompt_source,
+                parent_prompt_id=None,       # MVP: reuse UI not implemented yet
+            )
+
             with st.spinner(f"Generating {n_images} image(s) with {engine}…"):
                 try:
                     # If your engine supports size, wire it there.
-                    # For now your helper ignores size, so we do too.
-                    img_bytes_list = _generate_images_for_engine(engine, refined_prompt, n_images)
-
+                    img_bytes_list = _generate_images_for_engine(
+                        engine,
+                        refined_prompt,
+                        n_images,
+                    )
                 except Exception as e:  # noqa: BLE001
                     st.error(str(e))
                     return
@@ -1602,13 +1650,22 @@ def _render_prompt_generation_ui(slug: str) -> None:
                             engine=engine,
                             # Store what was actually used for generation.
                             prompt_text=refined_prompt,
-                            # Prep for Step 4: store the original intent too (even if override used).
-                            # If your _save_image_bytes doesn't accept these yet, add them in Step 4.
+                            # store original intent too (if your _save_image_bytes supports it)
                             input_text=intent_text,
                             refine_enabled=refine_enabled,
                             size=size,
                         )
                         saved_paths.append(path)
+
+                        # ✅ Attach prompt linkage to THIS image record
+                        _attach_prompt_to_image_metadata(
+                            slug,
+                            path.name,
+                            prompt_id=prompt_id,
+                            prompt_source=prompt_source,
+                            parent_prompt_id=None,
+                        )
+
                     except TypeError:
                         # Backward-compat: if _save_image_bytes doesn't accept the new kwargs yet
                         path, asset_id = _save_image_bytes(  # noqa: F821
@@ -1617,9 +1674,19 @@ def _render_prompt_generation_ui(slug: str) -> None:
                             generated=True,
                             kind="origin",
                             engine=engine,
-                            prompt_text=used_prompt,
+                            prompt_text=refined_prompt,
                         )
                         saved_paths.append(path)
+
+                        # ✅ Attach prompt linkage to THIS image record
+                        _attach_prompt_to_image_metadata(
+                            slug,
+                            path.name,
+                            prompt_id=prompt_id,
+                            prompt_source=prompt_source,
+                            parent_prompt_id=None,
+                        )
+
                     except Exception as e:  # noqa: BLE001
                         failed.append(f"Image {idx}: {e}")
 
@@ -2448,7 +2515,6 @@ def _render_gallery(slug: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-
 def main() -> None:
     st.title("Image Library")
 
@@ -2456,7 +2522,38 @@ def main() -> None:
     if not slug:
         st.warning("No campaign selected. Please choose a campaign on the Dashboard first.")
         return
-    
+
+    #temporary insert
+    from caf_app.prompt_store import (
+        campaign_prompts_path,
+        load_prompts_index,
+        upsert_prompt_record,
+    )
+
+    st.markdown("### 🧪 Prompt Library Sanity Test (temporary)")
+
+    slug = _get_current_slug()
+    st.write("slug =", slug)
+
+    if slug:
+        st.write("prompts_index path =", str(campaign_prompts_path(slug)))
+
+        if st.button("Create test prompt record"):
+            pid = upsert_prompt_record(
+                slug,
+                prompt_text="TEST PROMPT: banana mango hero image",
+                input_text="test input",
+                source="manual",
+                parent_prompt_id=None,
+            )
+            data = load_prompts_index(slug)
+            st.success(f"Created/updated prompt_id: {pid}")
+            st.write("prompt records =", len(data.get("prompts", {})))
+    else:
+        st.warning("No campaign selected (slug is empty).")
+
+    #end temporary insert
+
     # Inspector state (right panel selection)
     if "selected_image_name" not in st.session_state:
         st.session_state["selected_image_name"] = None
