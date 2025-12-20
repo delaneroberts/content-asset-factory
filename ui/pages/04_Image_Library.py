@@ -2150,7 +2150,7 @@ def _render_gallery(slug: str) -> None:
         if not selected_name:
             st.caption("Click ℹ️ on an image to view/edit metadata.")
         else:
-            info = meta.get(selected_name, {})
+            info = merged_info(selected_name)
 
             # ---------- Auto-default metadata ----------
             info_changed = False
@@ -2240,7 +2240,9 @@ def _render_gallery(slug: str) -> None:
 
             # ---------- Provenance (read-only) ----------
             engine_val = str(info.get("engine", ""))
-            prompt_val = str(info.get("prompt") or info.get("instructions") or "")
+            input_text_val = str(info.get("input_text") or "")
+            prompt_text_val = str(info.get("prompt_text") or info.get("prompt") or info.get("instructions") or "")
+
 
             st.markdown("### Provenance (read-only)")
             st.text_input(
@@ -2255,11 +2257,22 @@ def _render_gallery(slug: str) -> None:
                 disabled=True,
                 key=f"ins_engine_{slug}_{selected_name}",
             )
+
+            # Creative intent (original)
             st.text_area(
-                "Prompt / Instructions",
-                value=prompt_val,
+                "Creative intent (original)",
+                value=input_text_val,
                 disabled=True,
                 height=120,
+                key=f"ins_intent_{slug}_{selected_name}",
+            )
+
+            # Refined prompt used
+            st.text_area(
+                "Refined prompt (used)",
+                value=prompt_text_val,
+                disabled=True,
+                height=180,
                 key=f"ins_prompt_{slug}_{selected_name}",
             )
 
