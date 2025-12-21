@@ -1508,16 +1508,16 @@ def _render_prompt_generation_ui(slug: str) -> None:
     with st.expander("Open generator", expanded=False):
 
         # -------------------------
-        # GenStudio: Prompt refinement toggle (default ON)
+        # Prompt refinement toggle (default ON)
         # -------------------------
         refine_enabled = st.checkbox(
             "Refine prompt for best results",
             value=st.session_state.get("genstudio_refine_enabled", True),
             key="genstudio_refine_enabled",
-            help="When enabled, your free-form intent will be refined into a high-quality generation prompt (Step 2).",
+            help="When enabled, your free-form intent will be refined into a high-quality generation prompt.",
         )
 
-        # TEMP override (optional) — IMPORTANT: use a new key (avoid collisions)
+        # TEMP override (optional)
         override = (
             st.text_area(
                 "Legacy prompt (temporary override)",
@@ -1529,7 +1529,7 @@ def _render_prompt_generation_ui(slug: str) -> None:
         ).strip()
 
         # -------------------------
-        # Determine the text we will use for generation
+        # Determine text used for generation
         # -------------------------
         override_clean = (override or "").strip()
         used_prompt = override_clean if override_clean else (intent_text or "").strip()
@@ -1541,15 +1541,23 @@ def _render_prompt_generation_ui(slug: str) -> None:
             try:
                 client = OpenAI()
                 refinement = refine_prompt(used_prompt, client=client)
-                if refinement.refined_prompt:
-                    refined_prompt = refinement.refined_prompt.strip()
+                if refinement and getattr(refinement, "refined_prompt", None):
+                    refined_prompt = (refinement.refined_prompt or "").strip()
             except Exception as e:  # noqa: BLE001
                 st.warning(f"Prompt refinement failed; using original text. ({e})")
                 refined_prompt = used_prompt
                 refinement = None
 
+        # ✅ Safety fallback: never allow empty refined_prompt
+        if not (refined_prompt or "").strip():
+            refined_prompt = used_prompt
+
+        # Clean versions used everywhere downstream
+        used_prompt_clean = (used_prompt or "").strip()
+        refined_prompt_clean = (refined_prompt or "").strip() or used_prompt_clean
+
         st.caption(
-            f"Refine={refine_enabled} | Override_set={bool(override_clean)} | changed={refined_prompt != used_prompt}"
+            f"Refine={refine_enabled} | Override_set={bool(override_clean)} | changed={refined_prompt_clean != used_prompt_clean}"
         )
 
         # -------------------------
@@ -1583,53 +1591,79 @@ def _render_prompt_generation_ui(slug: str) -> None:
             )
 
         # -------------------------
-        # Preview what will be sent
+        # Preview
         # -------------------------
         with st.expander("Preview text to be generated", expanded=False):
-
             st.write("This is the text that will be sent to the image engine.")
 
-            if refinement and refined_prompt and refined_prompt != used_prompt:
+            if refinement and refined_prompt_clean and refined_prompt_clean != used_prompt_clean:
                 st.caption("Refined prompt (used for generation):")
-                st.code(refined_prompt, language="text")
+                st.code(refined_prompt_clean, language="text")
                 st.caption("Original intent:")
-                st.code(used_prompt, language="text")
+                st.code(used_prompt_clean or "(empty)", language="text")
             else:
                 st.caption("Prompt (used for generation):")
-                st.code(refined_prompt or "(empty)", language="text")
+                st.code(refined_prompt_clean or "(empty)", language="text")
 
         # -------------------------
-        # Action
+        # Action (outside preview expander)
         # -------------------------
         if st.button("Generate images", type="primary", key=f"gen_btn_{slug}"):
 
-            if not used_prompt:
+            # Guard: must have something to generate
+            if not used_prompt_clean:
                 st.warning("Please enter your description (or provide an override).")
                 return
 
             # =========================================================
-            # ✅ Step 2 hook: upsert prompt record ONCE per click
+            # ✅ Intent -> refined lineage (Step 4)
             # =========================================================
-            prompt_source = (
-                "refine"
-                if (refine_enabled and refined_prompt and refined_prompt != used_prompt)
-                else "manual"
+            refinement_used = bool(
+                refine_enabled
+                and refined_prompt_clean
+                and refined_prompt_clean != used_prompt_clean
+                and not override_clean  # if override is set, treat as manual
             )
 
-            prompt_id = upsert_prompt_record(
-                slug,
-                prompt_text=refined_prompt,  # what we actually send to engine
-                input_text=intent_text,      # what user typed
-                source=prompt_source,
-                parent_prompt_id=None,       # MVP: reuse UI not implemented yet
-            )
+            intent_prompt_id: str | None = None
 
+            if refinement_used:
+                # 1) Upsert INTENT prompt
+                intent_prompt_id = upsert_prompt_record(
+                    slug,
+                    prompt_text=used_prompt_clean,
+                    input_text=intent_text,
+                    source="manual",
+                    parent_prompt_id=None,
+                )
+
+                # 2) Upsert REFINED prompt linked to intent
+                prompt_source = "refine"
+                prompt_id = upsert_prompt_record(
+                    slug,
+                    prompt_text=refined_prompt_clean,
+                    input_text=intent_text,
+                    source=prompt_source,
+                    parent_prompt_id=intent_prompt_id,
+                )
+            else:
+                prompt_source = "manual"
+                prompt_id = upsert_prompt_record(
+                    slug,
+                    prompt_text=refined_prompt_clean,
+                    input_text=intent_text,
+                    source=prompt_source,
+                    parent_prompt_id=None,
+                )
+
+            # -------------------------
+            # Generate + Save
+            # -------------------------
             with st.spinner(f"Generating {n_images} image(s) with {engine}…"):
                 try:
-                    # If your engine supports size, wire it there.
                     img_bytes_list = _generate_images_for_engine(
                         engine,
-                        refined_prompt,
+                        refined_prompt_clean,
                         n_images,
                     )
                 except Exception as e:  # noqa: BLE001
@@ -1641,29 +1675,25 @@ def _render_prompt_generation_ui(slug: str) -> None:
 
                 for idx, img_bytes in enumerate(img_bytes_list, start=1):
                     try:
-                        # Origin images start NEW families (versioning handled in _save_image_bytes/_update_image_metadata_entry)
                         path, asset_id = _save_image_bytes(  # noqa: F821
                             slug,
                             img_bytes,
                             generated=True,
                             kind="origin",
                             engine=engine,
-                            # Store what was actually used for generation.
-                            prompt_text=refined_prompt,
-                            # store original intent too (if your _save_image_bytes supports it)
+                            prompt_text=refined_prompt_clean,
                             input_text=intent_text,
                             refine_enabled=refine_enabled,
                             size=size,
                         )
                         saved_paths.append(path)
 
-                        # ✅ Attach prompt linkage to THIS image record
                         _attach_prompt_to_image_metadata(
                             slug,
                             path.name,
                             prompt_id=prompt_id,
                             prompt_source=prompt_source,
-                            parent_prompt_id=None,
+                            parent_prompt_id=intent_prompt_id,
                         )
 
                     except TypeError:
@@ -1674,17 +1704,16 @@ def _render_prompt_generation_ui(slug: str) -> None:
                             generated=True,
                             kind="origin",
                             engine=engine,
-                            prompt_text=refined_prompt,
+                            prompt_text=refined_prompt_clean,
                         )
                         saved_paths.append(path)
 
-                        # ✅ Attach prompt linkage to THIS image record
                         _attach_prompt_to_image_metadata(
                             slug,
                             path.name,
                             prompt_id=prompt_id,
                             prompt_source=prompt_source,
-                            parent_prompt_id=None,
+                            parent_prompt_id=intent_prompt_id,
                         )
 
                     except Exception as e:  # noqa: BLE001
@@ -1700,7 +1729,6 @@ def _render_prompt_generation_ui(slug: str) -> None:
                     st.write(f"• ...and {len(failed) - 8} more")
 
             st.rerun()
-
 
 def _render_export_section(slug: str) -> None:
     st.markdown("### 📦 Export Campaign Images")
