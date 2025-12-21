@@ -26,6 +26,7 @@ from openai import OpenAI
 from typing import Dict, List
 from pathlib import Path
 from caf_app.prompt_store import upsert_prompt_record
+from caf_app.prompt_store import load_prompts_index
 
 
 
@@ -77,6 +78,135 @@ STABILITY_API_KEY = os.getenv("STABILITY_API_KEY")
 HF_API_KEY = os.getenv("HF_API_KEY")
 HF_NANOBANANA_MODEL_ID = os.getenv("HF_NANOBANANA_MODEL_ID")
 
+def _render_campaign_prompt_library(slug: str) -> None:
+    """
+    Campaign-local Prompt Library (MVP UX):
+    - Groups by intent prompts (source='manual' and parent_prompt_id is None)
+    - Shows refined children under each intent
+    - Reuse loads intent into editor using pending keys (Streamlit-safe)
+    - Optional: reuse as override
+    - Search + sort + results count
+    - Hide obvious test prompts
+    """
+    data = load_prompts_index(slug)
+    prompts: dict = data.get("prompts", {}) if isinstance(data, dict) else {}
+
+    with st.expander("📚 Prompt Library (Campaign)", expanded=False):
+        if not prompts:
+            st.caption("No prompts saved yet. Generate an image to start building your campaign prompt library.")
+            return
+
+        # --- Controls ---
+        q = (st.text_input("Search prompts", value="", key=f"promptlib_q_{slug}") or "").strip().lower()
+        sort_mode = st.selectbox(
+            "Sort",
+            ["Most recent", "Most used"],
+            index=0,
+            key=f"promptlib_sort_{slug}",
+        )
+        show_children = st.checkbox("Show refined children", value=True, key=f"promptlib_children_{slug}")
+        hide_tests = st.checkbox("Hide test prompts", value=True, key=f"promptlib_hide_tests_{slug}")
+
+        # --- Index prompts ---
+        intents: list[dict] = []
+        children_by_parent: dict[str, list[dict]] = {}
+
+        for rec in prompts.values():
+            if not isinstance(rec, dict):
+                continue
+            pid = rec.get("prompt_id")
+            if not pid:
+                continue
+
+            parent_id = rec.get("parent_prompt_id")
+            if parent_id:
+                children_by_parent.setdefault(parent_id, []).append(rec)
+            else:
+                if rec.get("source") == "manual":
+                    intents.append(rec)
+
+        def matches_search(rec: dict) -> bool:
+            if not q:
+                return True
+            txt = (rec.get("prompt_text") or "").lower()
+            itx = (rec.get("input_text") or "").lower()
+            return q in txt or q in itx
+
+        # Filter intents
+        filtered_intents: list[dict] = []
+        for r in intents:
+            t = (r.get("prompt_text") or "").strip()
+            if hide_tests and t.lower().startswith("test prompt:"):
+                continue
+            if matches_search(r):
+                filtered_intents.append(r)
+
+        total = len(intents)
+        shown = len(filtered_intents)
+        st.caption(f"Showing **{shown}** of **{total}** intent prompts.")
+
+        # Sort intents
+        if sort_mode == "Most used":
+            filtered_intents.sort(key=lambda r: int(r.get("usage_count", 0)), reverse=True)
+        else:
+            filtered_intents.sort(key=lambda r: (r.get("last_used_at") or ""), reverse=True)
+
+        # --- Render ---
+        for intent in filtered_intents:
+            intent_id = intent.get("prompt_id") or ""
+            intent_text = (intent.get("prompt_text") or "").strip()
+            usage = int(intent.get("usage_count", 0))
+            last_used = intent.get("last_used_at", "")
+
+            header = f"{intent_text[:90]}{'…' if len(intent_text) > 90 else ''}"
+            meta = f"used {usage} • last {last_used}" if last_used else f"used {usage}"
+
+            st.markdown(f"**{header}**")
+            st.caption(meta)
+
+            b1, b2, b3 = st.columns([1, 1, 6])
+            with b1:
+                if st.button("Reuse", key=f"promptlib_reuse_{slug}_{intent_id}"):
+                    # Streamlit-safe: set pending values, then rerun
+                    st.session_state["genstudio_intent_text_pending"] = intent_text
+                    st.session_state["genstudio_override_pending"] = ("", slug)  # clear override
+                    st.session_state["base_prompt_id"] = intent_id
+                    st.session_state["genstudio_toast"] = "Loaded intent into editor."
+                    st.rerun()
+
+            with b2:
+                if st.button("Use as override", key=f"promptlib_override_{slug}_{intent_id}"):
+                    # Put intent text into override (skips refinement)
+                    st.session_state["genstudio_intent_text_pending"] = ""
+                    st.session_state["genstudio_override_pending"] = (intent_text, slug)
+                    st.session_state["base_prompt_id"] = intent_id
+                    st.session_state["genstudio_toast"] = "Loaded prompt as override (refinement skipped)."
+                    st.rerun()
+
+            with b3:
+                with st.expander("View intent text", expanded=False):
+                    st.code(intent_text or "(empty)", language="text")
+
+            # Children (refined variants)
+            if show_children and intent_id:
+                kids = children_by_parent.get(intent_id, [])
+
+                # Optional: apply same search to children too
+                if q:
+                    kids = [k for k in kids if matches_search(k)]
+
+                # Sort children by created_at desc
+                kids.sort(key=lambda r: (r.get("created_at") or ""), reverse=True)
+
+                if kids:
+                    with st.expander(f"Refined children ({len(kids)})", expanded=False):
+                        for k in kids[:20]:
+                            ktxt = (k.get("prompt_text") or "").strip()
+                            k_created = k.get("created_at", "")
+                            st.caption(k_created)
+                            st.code(ktxt[:800] + ("…" if len(ktxt) > 800 else ""), language="text")
+
+            st.markdown("---")
 
 # ---------------------------------------------------------------------------
 # Superceed, versioning helpers
@@ -1489,16 +1619,31 @@ def _attach_prompt_to_image_metadata(
 # Only place prompt-based generation is done
 def _render_prompt_generation_ui(slug: str) -> None:
     st.markdown("### 🎨 Generate Images From Prompt")
+    
+    if "genstudio_override_pending" in st.session_state:
+        new_override_value, pending_slug = st.session_state.pop("genstudio_override_pending")
+        if pending_slug == slug:
+            st.session_state[f"gen_override_{slug}"] = new_override_value
 
-    # -------------------------
-    # GenStudio: Creative Intent (human-friendly)
-    # -------------------------
+    # Apply pending prompt loads BEFORE widget instantiation
+    if "genstudio_intent_text_pending" in st.session_state:
+        st.session_state["genstudio_intent_text"] = st.session_state.pop("genstudio_intent_text_pending")
+
+    # ✅ REQUIRED INSERTION: Apply pending override BEFORE override widget instantiation
+    if "genstudio_override_pending" in st.session_state:
+        new_override_value, pending_slug = st.session_state.pop("genstudio_override_pending")
+        if pending_slug == slug:
+            st.session_state[f"gen_override_{slug}"] = new_override_value
+
+    if "genstudio_toast" in st.session_state:
+        st.success(st.session_state.pop("genstudio_toast"))
+
     st.markdown("#### Describe what you want")
 
     intent_text = (
         st.text_area(
             "Write freely — goals, mood, audience, constraints. You can paste briefs, notes, or copy.",
-            value=st.session_state.get("genstudio_intent_text", ""),
+            value=st.session_state.get("genstudio_intent_text", ""),  # optional (redundant)
             height=180,
             key="genstudio_intent_text",
         )
@@ -1517,25 +1662,29 @@ def _render_prompt_generation_ui(slug: str) -> None:
             help="When enabled, your free-form intent will be refined into a high-quality generation prompt.",
         )
 
-        # TEMP override (optional)
+        # -------------------------
+        # Override prompt (optional)
+        # -------------------------
         override = (
             st.text_area(
-                "Legacy prompt (temporary override)",
-                placeholder="Optional: override the intent text for generation…",
+                "Override prompt (skip refinement)",
+                placeholder="Optional: if set, this exact text is sent to the engine and the intent box is ignored.",
                 height=120,
                 key=f"gen_override_{slug}",
+                help="Use this when you already have a final generation prompt. When set, refinement is bypassed.",
             )
             or ""
         ).strip()
 
-        # -------------------------
-        # Determine text used for generation
-        # -------------------------
+
+        # =========================================================
+        # 🔑 DETERMINE PROMPT TEXT + REFINEMENT
+        # =========================================================
         override_clean = (override or "").strip()
         used_prompt = override_clean if override_clean else (intent_text or "").strip()
 
-        refined_prompt = used_prompt
         refinement = None
+        refined_prompt = used_prompt
 
         if refine_enabled and (not override_clean) and used_prompt:
             try:
@@ -1548,28 +1697,32 @@ def _render_prompt_generation_ui(slug: str) -> None:
                 refined_prompt = used_prompt
                 refinement = None
 
-        # ✅ Safety fallback: never allow empty refined_prompt
+        # Safety: never allow empty prompt downstream
         if not (refined_prompt or "").strip():
             refined_prompt = used_prompt
 
-        # Clean versions used everywhere downstream
         used_prompt_clean = (used_prompt or "").strip()
         refined_prompt_clean = (refined_prompt or "").strip() or used_prompt_clean
 
-        st.caption(
-            f"Refine={refine_enabled} | Override_set={bool(override_clean)} | changed={refined_prompt_clean != used_prompt_clean}"
-        )
+        # Human-readable status (no debug noise)
+        if override_clean:
+            st.caption("Using **override prompt** (refinement skipped).")
+        elif refine_enabled and refined_prompt_clean != used_prompt_clean:
+            st.caption("Using **refined prompt** (based on your intent).")
+        else:
+            st.caption("Using **intent text as prompt**.")
+
 
         # -------------------------
         # Controls
         # -------------------------
         col1, col2, col3 = st.columns(3)
+
         with col1:
             engine = st.selectbox(
                 "Engine",
                 ["stability", "openai", "nanobanana"],
                 index=0,
-                help="Which image engine to use.",
                 key=f"gen_engine_{slug}",
             )
 
@@ -1590,45 +1743,48 @@ def _render_prompt_generation_ui(slug: str) -> None:
                 key=f"gen_size_{slug}",
             )
 
+        # =========================================================
+        # 📚 STEP 5: Campaign Prompt Library
+        # =========================================================
+        _render_campaign_prompt_library(slug)
+
         # -------------------------
         # Preview
         # -------------------------
         with st.expander("Preview text to be generated", expanded=False):
             st.write("This is the text that will be sent to the image engine.")
 
-            if refinement and refined_prompt_clean and refined_prompt_clean != used_prompt_clean:
-                st.caption("Refined prompt (used for generation):")
+            if refinement and refined_prompt_clean != used_prompt_clean:
+                st.caption("Prompt sent to engine (refined):")
                 st.code(refined_prompt_clean, language="text")
-                st.caption("Original intent:")
+                st.caption("Intent text:")
                 st.code(used_prompt_clean or "(empty)", language="text")
             else:
-                st.caption("Prompt (used for generation):")
+                st.caption("Prompt sent to engine:")
                 st.code(refined_prompt_clean or "(empty)", language="text")
 
+
         # -------------------------
-        # Action (outside preview expander)
+        # Action
         # -------------------------
         if st.button("Generate images", type="primary", key=f"gen_btn_{slug}"):
 
-            # Guard: must have something to generate
             if not used_prompt_clean:
                 st.warning("Please enter your description (or provide an override).")
                 return
 
             # =========================================================
-            # ✅ Intent -> refined lineage (Step 4)
+            # ✅ Intent → Refined lineage
             # =========================================================
-            refinement_used = bool(
+            refinement_used = (
                 refine_enabled
-                and refined_prompt_clean
                 and refined_prompt_clean != used_prompt_clean
-                and not override_clean  # if override is set, treat as manual
+                and not override_clean
             )
 
             intent_prompt_id: str | None = None
 
             if refinement_used:
-                # 1) Upsert INTENT prompt
                 intent_prompt_id = upsert_prompt_record(
                     slug,
                     prompt_text=used_prompt_clean,
@@ -1637,7 +1793,6 @@ def _render_prompt_generation_ui(slug: str) -> None:
                     parent_prompt_id=None,
                 )
 
-                # 2) Upsert REFINED prompt linked to intent
                 prompt_source = "refine"
                 prompt_id = upsert_prompt_record(
                     slug,
@@ -1697,7 +1852,6 @@ def _render_prompt_generation_ui(slug: str) -> None:
                         )
 
                     except TypeError:
-                        # Backward-compat: if _save_image_bytes doesn't accept the new kwargs yet
                         path, asset_id = _save_image_bytes(  # noqa: F821
                             slug,
                             img_bytes,
@@ -1721,6 +1875,7 @@ def _render_prompt_generation_ui(slug: str) -> None:
 
             if saved_paths:
                 st.success(f"Saved {len(saved_paths)} image(s) to this campaign.")
+
             if failed:
                 st.warning("Some images failed to save:")
                 for msg in failed[:8]:
@@ -1729,6 +1884,7 @@ def _render_prompt_generation_ui(slug: str) -> None:
                     st.write(f"• ...and {len(failed) - 8} more")
 
             st.rerun()
+
 
 def _render_export_section(slug: str) -> None:
     st.markdown("### 📦 Export Campaign Images")
@@ -2550,37 +2706,6 @@ def main() -> None:
     if not slug:
         st.warning("No campaign selected. Please choose a campaign on the Dashboard first.")
         return
-
-    #temporary insert
-    from caf_app.prompt_store import (
-        campaign_prompts_path,
-        load_prompts_index,
-        upsert_prompt_record,
-    )
-
-    st.markdown("### 🧪 Prompt Library Sanity Test (temporary)")
-
-    slug = _get_current_slug()
-    st.write("slug =", slug)
-
-    if slug:
-        st.write("prompts_index path =", str(campaign_prompts_path(slug)))
-
-        if st.button("Create test prompt record"):
-            pid = upsert_prompt_record(
-                slug,
-                prompt_text="TEST PROMPT: banana mango hero image",
-                input_text="test input",
-                source="manual",
-                parent_prompt_id=None,
-            )
-            data = load_prompts_index(slug)
-            st.success(f"Created/updated prompt_id: {pid}")
-            st.write("prompt records =", len(data.get("prompts", {})))
-    else:
-        st.warning("No campaign selected (slug is empty).")
-
-    #end temporary insert
 
     # Inspector state (right panel selection)
     if "selected_image_name" not in st.session_state:
